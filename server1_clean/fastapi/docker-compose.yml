@@ -1,0 +1,84 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: feature-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dataplatform
+      POSTGRES_PASSWORD: Dataplatform@123
+      POSTGRES_DB: feature_db
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dataplatform -d feature_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: feature-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: admin12345
+    volumes:
+      - ./data/minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: feature-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 admin admin12345 &&
+      mc mb --ignore-existing local/business &&
+      mc mb --ignore-existing local/feast-data &&
+      mc mb --ignore-existing local/mlflow-artifacts &&
+      mc mb --ignore-existing local/feast-definitions &&
+      echo 'Buckets ready.'
+      "
+    restart: "no"
+
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: feature-fastapi
+    container_name: feature-fastapi
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    env_file:
+      - ./app/.env.docker
+    ports:
+      - "10.155.38.139:8000:8000"
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000
+    volumes:
+      - ./app:/app
+      - ./data/state:/app/state
+      - ./data/feast_repo:/app/feast_repo
+    networks:
+      - default
+      - mlflow_shared
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+networks:
+  mlflow_shared:
+    external: true
+    name: mlflow_default

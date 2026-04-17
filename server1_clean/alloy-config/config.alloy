@@ -1,0 +1,68 @@
+logging {
+  level = "info"
+}
+
+// Alloy self metrics
+
+prometheus.exporter.self "default" {}
+
+prometheus.scrape "alloy_self" {
+  targets    = prometheus.exporter.self.default.targets
+  forward_to = []
+}
+
+// Discover Docker containers
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+// Relabel logs
+
+discovery.relabel "docker_logs" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+    replacement   = "$1"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_image"]
+    target_label  = "image"
+  }
+
+  rule {
+    target_label = "host"
+    replacement  = "server1"
+  }
+
+  rule {
+    target_label = "job"
+    replacement  = "docker"
+  }
+}
+
+// Collect all container logs
+
+loki.source.docker "containers" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.docker.containers.targets
+  relabel_rules = discovery.relabel.docker_logs.rules
+  forward_to    = [loki.write.default.receiver]
+}
+
+// Send logs to Loki (observability machine)
+
+loki.write "default" {
+  endpoint {
+    url = "http://10.155.38.64:3100/loki/api/v1/push"
+  }
+
+  external_labels = {
+    source = "server1",
+  }
+}
+ 
