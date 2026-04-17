@@ -1,0 +1,70 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+
+  - job_name: grafana
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['obs-grafana:3000']
+
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - "obs-prometheus:9090"
+
+  - job_name: kafka-jmx
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "10.80.211.65:9404"
+
+  - job_name: kafka-exporter
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "10.80.211.65:9308"
+
+  - job_name: minio
+    metrics_path: /minio/v2/metrics/cluster
+    static_configs:
+      - targets:
+          - "10.80.211.139:9000"
+
+  - job_name: "spark-master"
+    metrics_path: /metrics/master/prometheus
+    static_configs:
+      - targets: ["10.80.211.206:8080"]
+
+  - job_name: "spark-worker"
+    metrics_path: /metrics/worker/prometheus
+    static_configs:
+      - targets: ["10.80.211.206:8081"]
+
+  - job_name: "spark-api"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["10.80.211.206:9003"]
+
+  - job_name: "openmetadata"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["10.155.38.139:8585"]
+
+  - job_name: "fastapi"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["10.155.38.139:8000"]
+
+  - job_name: "alloy"
+    static_configs:
+      - targets: ['10.155.38.139:12345']
+
+  - job_name: "airflow"
+    static_configs:
+      - targets: ['10.155.38.139:9102']
+
+  - job_name: "keycloak"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['10.155.38.139:9000']

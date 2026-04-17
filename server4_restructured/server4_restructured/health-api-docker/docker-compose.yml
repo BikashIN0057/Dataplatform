@@ -1,0 +1,56 @@
+services:
+
+  obs-postgres:
+    image: postgres:16
+    container_name: obs-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:5432:5432"     # internal only — not exposed over ZeroTier
+    volumes:
+      - obs_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - obsnet
+    restart: unless-stopped
+
+  health-api:
+    build: .
+    container_name: obs-health-api
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@obs-postgres:5432/${POSTGRES_DB}
+      PROMETHEUS_BASE_URL: ${PROMETHEUS_BASE_URL}
+      GRAFANA_HEALTH_URL: ${GRAFANA_HEALTH_URL}
+      KAFKA_HOST: ${KAFKA_HOST}
+      KAFKA_PORT: ${KAFKA_PORT}
+    ports:
+      - "0.0.0.0:${HEALTH_API_PORT}:8000"
+    depends_on:
+      obs-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - obsnet
+    restart: unless-stopped
+
+networks:
+  obsnet:
+    external: true
+    name: observability-stack_default
+
+volumes:
+  obs_postgres_data:

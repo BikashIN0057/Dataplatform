@@ -1,0 +1,24 @@
+services:
+  streamlit-ui:
+    build: .
+    container_name: obs-streamlit-ui
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "0.0.0.0:${STREAMLIT_PORT}:8501"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8501/_stcore/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - obsnet
+    restart: unless-stopped
+
+networks:
+  obsnet:
+    external: true
+    name: observability-stack_default

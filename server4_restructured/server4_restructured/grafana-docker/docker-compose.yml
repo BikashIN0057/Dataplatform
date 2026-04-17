@@ -1,0 +1,35 @@
+services:
+  grafana:
+    image: grafana/grafana:latest
+    container_name: obs-grafana
+    env_file:
+      - .env
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GF_SECURITY_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD}
+      GF_SERVER_HTTP_ADDR: "0.0.0.0"
+      GF_SERVER_HTTP_PORT: "3000"
+      GF_SERVER_ROOT_URL: "http://${GRAFANA_HOST}:${GRAFANA_PORT}"
+      GF_METRICS_ENABLED: "true"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./provisioning:/etc/grafana/provisioning
+    ports:
+      - "0.0.0.0:${GRAFANA_PORT}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - obsnet
+    restart: unless-stopped
+
+networks:
+  obsnet:
+    external: true
+    name: observability-stack_default
+
+volumes:
+  grafana_data:

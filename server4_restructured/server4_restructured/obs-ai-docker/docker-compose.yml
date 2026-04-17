@@ -1,0 +1,66 @@
+services:
+  obs-log-ai-api:
+    build: ./app
+    container_name: obs-log-ai-api
+    env_file:
+      - .env
+    environment:
+      LOKI_URL: http://obs-loki:3100
+      LLM_PROVIDER: ${LLM_PROVIDER}
+      OLLAMA_URL: ${OLLAMA_URL}
+      OLLAMA_MODEL: ${OLLAMA_MODEL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+      ARCHIVE_DIR: /data/archive
+      DATA_DIR: /data
+      LOKI_RETENTION_PERIOD: 168h
+      LOKI_TENANT_ID: fake
+    ports:
+      - "0.0.0.0:${OBS_AI_PORT}:8088"
+    volumes:
+      - ./archive:/data/archive
+      - ./data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8088/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - obsnet
+    restart: unless-stopped
+
+  obs-event-collector:
+    build:
+      context: .
+      dockerfile: Dockerfile.event-collector
+    container_name: obs-event-collector
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - obsnet
+    restart: unless-stopped
+
+  obs-ollama:
+    image: ollama/ollama:latest
+    container_name: obs-ollama
+    ports:
+      - "0.0.0.0:11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - obsnet
+    profiles:
+      - ollama
+    restart: unless-stopped
+
+networks:
+  obsnet:
+    external: true
+    name: observability-stack_default
+
+volumes:
+  ollama_data:
