@@ -1,0 +1,40 @@
+services:
+  obs-ollama:
+    image: ollama/ollama:latest
+    container_name: obs-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    networks:
+      - obsnet
+
+  obs-log-ai-api:
+    build: ./app
+    container_name: obs-log-ai-api
+    environment:
+      LOKI_URL: http://obs-loki:3100
+      OLLAMA_URL: http://obs-ollama:11434
+      OLLAMA_MODEL: llama3.2:1b
+      ARCHIVE_DIR: /data/archive
+      LOKI_RETENTION_PERIOD: 168h
+      LOKI_TENANT_ID: fake
+    ports:
+      - "8088:8088"
+    volumes:
+      - ./archive:/data/archive
+    depends_on:
+      - obs-ollama
+    restart: unless-stopped
+    networks:
+      - obsnet
+
+networks:
+  obsnet:
+    external: true
+    name: observability-stack_default
+
+volumes:
+  ollama_data:
+    external: true

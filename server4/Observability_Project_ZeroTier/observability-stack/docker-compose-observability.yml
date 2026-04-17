@@ -1,0 +1,105 @@
+services:
+
+  postgres:
+    env_file:
+      - .env
+    image: postgres:16
+    container_name: obs-postgres
+    ports:
+      - "127.0.0.1:5432:5432"      # internal only — not exposed over ZeroTier
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - obsnet
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: obs-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "0.0.0.0:9090:9090"
+    networks:
+      - obsnet
+    restart: unless-stopped
+  grafana:
+    env_file:
+      - .env
+    image: grafana/grafana:latest
+    container_name: obs-grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      GF_SERVER_HTTP_ADDR: "0.0.0.0"
+      GF_SERVER_HTTP_PORT: "3000"
+      GF_SERVER_ROOT_URL: "http://10.155.38.64:3000"
+      GF_METRICS_ENABLED: "true"
+    ports:
+      - "0.0.0.0:3000:3000"        # accessible on ZeroTier 10.155.38.64:3000
+    depends_on:
+      - prometheus
+    networks:
+      - obsnet
+    restart: unless-stopped
+
+  health-api:
+    build: ./health-api
+    container_name: obs-health-api
+    environment:
+      DATABASE_URL: postgresql://admin:admin123@obs-postgres:5432/mydb
+      PROMETHEUS_BASE_URL: http://obs-prometheus:9090
+      GRAFANA_HEALTH_URL: http://obs-grafana:3000/api/health
+      KAFKA_HOST: "10.155.38.64"
+      KAFKA_PORT: "9092"
+      MINIO_HEALTH_URL: "http://10.80.211.139:9000/minio/health/live"
+    ports:
+      - "0.0.0.0:8005:8000"        # accessible on ZeroTier 10.155.38.64:8005
+    depends_on:
+      - postgres
+      - prometheus
+      - grafana
+    networks:
+      - obsnet
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:latest
+    container_name: obs-loki
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports:
+      - "0.0.0.0:3100:3100"        # accessible on ZeroTier 10.155.38.64:3100
+    networks:
+      - obsnet
+    restart: unless-stopped
+
+  obs-alloy:
+    image: grafana/alloy:latest
+    container_name: obs-alloy
+    command: ["run", "/etc/alloy/config.alloy"]
+    ports:
+      - "0.0.0.0:12345:12345"      # Alloy UI on ZeroTier 10.155.38.64:12345
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+    networks:
+      - obsnet
+    restart: unless-stopped
+
+networks:
+  obsnet:
+    name: observability-stack_default   # fixed name so other stacks can join it
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  grafana_data:

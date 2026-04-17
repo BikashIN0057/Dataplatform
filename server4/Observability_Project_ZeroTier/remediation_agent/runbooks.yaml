@@ -1,0 +1,63 @@
+runbooks:
+  - id: systemd_restart
+    title: Restart unhealthy systemd service
+    runtime: systemd
+    issues: ["down", "unhealthy", "crash_loop", "dependency_timeout", "connection_refused"]
+    risk: low
+    steps:
+      - name: Service status
+        command: "systemctl status {service_name} --no-pager || true"
+        timeout: 20
+      - name: Recent logs
+        command: "journalctl -u {service_name} -n 120 --no-pager || true"
+        timeout: 20
+      - name: Restart service
+        command: "systemctl restart {service_name}"
+        timeout: 40
+    validation:
+      - name: Service active
+        command: "systemctl is-active {service_name}"
+        expect_contains: "active"
+        timeout: 10
+
+  - id: docker_restart
+    title: Restart unhealthy Docker container
+    runtime: docker
+    issues: ["down", "unhealthy", "crash_loop", "dependency_timeout", "connection_refused"]
+    risk: low
+    steps:
+      - name: Container inspect
+        command: "docker inspect {container_name} || true"
+        timeout: 20
+      - name: Recent container logs
+        command: "docker logs --tail 120 {container_name} || true"
+        timeout: 20
+      - name: Restart container
+        command: "docker restart {container_name}"
+        timeout: 40
+    validation:
+      - name: Container running
+        command: "docker inspect -f '{{.State.Running}}' {container_name}"
+        expect_contains: "true"
+        timeout: 10
+
+  - id: docker_compose_restart
+    title: Restart unhealthy Docker Compose service
+    runtime: docker-compose
+    issues: ["down", "unhealthy", "crash_loop", "dependency_timeout", "connection_refused"]
+    risk: low
+    steps:
+      - name: Compose ps
+        command: "docker compose ps {compose_service} || true"
+        timeout: 20
+      - name: Compose logs
+        command: "docker compose logs --tail=120 {compose_service} || true"
+        timeout: 20
+      - name: Compose restart
+        command: "docker compose restart {compose_service}"
+        timeout: 40
+    validation:
+      - name: Compose ps after restart
+        command: "docker compose ps {compose_service}"
+        expect_contains: "{compose_service}"
+        timeout: 10

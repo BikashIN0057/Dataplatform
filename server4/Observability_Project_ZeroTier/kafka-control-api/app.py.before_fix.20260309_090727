@@ -1,0 +1,2039 @@
+import streamlit as st
+from datetime import datetime
+import pandas as pd
+import uuid
+from urllib.parse import quote_plus, unquote_plus, parse_qs
+import urllib.parse
+import re
+import requests
+import os
+from logs_page import page_logs
+from ask_ai_page import page_ask_ai
+
+st.set_page_config(layout="wide", page_title="Data Platform Console (Mock)")
+
+SMALL_FONT_CSS = """
+<style>
+html, body, [class*="css"]  { font-size: 12px; }
+textarea { font-size: 12px !important; }
+input { font-size: 12px !important; }
+</style>
+"""
+st.markdown(SMALL_FONT_CSS, unsafe_allow_html=True)
+
+SUCCESS_BOX_CSS = """
+<style>
+.successbox {
+  padding: 0.75rem 1rem;
+  border-radius: 0.5rem;
+  background: rgba(0, 255, 0, 0.12);
+  border: 1px solid rgba(0, 255, 0, 0.35);
+}
+.successbox a { text-decoration: underline; }
+</style>
+"""
+st.markdown(SUCCESS_BOX_CSS, unsafe_allow_html=True)
+
+
+def success_box(markdown_text: str):
+    # Renders a green success-style box that supports hyperlinks
+    st.markdown(f"<div class='successbox'>{markdown_text}</div>", unsafe_allow_html=True)
+
+
+# ------------------------------
+# RBAC (mock but realistic)
+# ------------------------------
+ROLE_TEAMS = {
+    "Admin": "Platform",
+    "Data Engineer": "DataEng",
+    "Data Analyst": "Analytics",
+    "ML Engineer": "ML",
+}
+
+# Actions (platform-level)
+A_VIEW_HEALTH = "view_health"
+A_MANAGE_ORG = "manage_org_hierarchy"
+A_EDIT_METADATA = "edit_metadata"
+A_SUBMIT_INGESTION = "submit_ingestion"
+A_SUBMIT_QUERY = "submit_query"
+A_MANAGE_FEATURES = "manage_features"
+A_TRAIN_MODELS = "train_models"
+A_PUBLISH_ASSET = "publish_asset"
+A_SET_VISIBILITY = "set_visibility"
+A_VIEW_RBAC = "view_rbac_matrix"
+
+ROLE_PERMS = {
+    "Admin": {A_VIEW_HEALTH, A_MANAGE_ORG, A_EDIT_METADATA, A_SUBMIT_INGESTION, A_SUBMIT_QUERY,
+              A_MANAGE_FEATURES, A_TRAIN_MODELS, A_PUBLISH_ASSET, A_SET_VISIBILITY, A_VIEW_RBAC},
+    "Data Engineer": {A_VIEW_HEALTH, A_SUBMIT_INGESTION, A_PUBLISH_ASSET, A_SET_VISIBILITY},
+    "Data Analyst": {A_VIEW_HEALTH, A_SUBMIT_QUERY, A_PUBLISH_ASSET},
+    "ML Engineer": {A_VIEW_HEALTH, A_MANAGE_FEATURES, A_TRAIN_MODELS, A_PUBLISH_ASSET, A_SET_VISIBILITY},
+}
+
+
+def can(action: str) -> bool:
+    role = st.session_state.get("role", None)
+    if not role:
+        return False
+    return action in ROLE_PERMS.get(role, set())
+
+
+def enforce(action: str):
+    """Stop the current run if the user is not allowed to perform `action`."""
+    if not can(action):
+        role = st.session_state.get('role', 'Unknown')
+        st.error(f"Not authorized: role '{role}' cannot perform '{action}'.")
+        st.stop()
+
+
+# ------------------------------
+# LINEAGE (edges table)
+# ------------------------------
+def add_lineage_edge(from_type: str, from_id: str, to_type: str, to_id: str, relation: str):
+    edge_id = f"LIN-{str(uuid.uuid4())[:8]}"
+    created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    row = {
+        "Edge Id": edge_id,
+        "From Type": from_type,
+        "From Id": from_id,
+        "To Type": to_type,
+        "To Id": to_id,
+        "Relation": relation,
+        "Created At": created,
+    }
+    st.session_state.lineage_table = pd.concat([st.session_state.lineage_table, pd.DataFrame([row])], ignore_index=True)
+
+
+def add_field_lineage(src_dataset: str, src_col: str, tgt_dataset: str, tgt_col: str, transform: str):
+    edge_id = f"FLN-{str(uuid.uuid4())[:8]}"
+    created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    row = {
+        "Edge Id": edge_id,
+        "Source Dataset": src_dataset,
+        "Source Column": src_col,
+        "Target Dataset": tgt_dataset,
+        "Target Column": tgt_col,
+        "Transform": transform,
+        "Created At": created,
+    }
+    st.session_state.field_lineage_table = pd.concat([
+        st.session_state.field_lineage_table, pd.DataFrame([row])
+    ], ignore_index=True)
+    return edge_id
+
+
+def add_field_lineage_edge(src_dataset: str, src_col: str, tgt_dataset: str, tgt_col: str, transform: str,
+                           created: str | None = None):
+    # Backward/forward compatible wrapper
+    if created is None:
+        return add_field_lineage(src_dataset, src_col, tgt_dataset, tgt_col, transform)
+    edge_id = f"FLN-{str(uuid.uuid4())[:8]}"
+    row = {
+        "Edge Id": edge_id,
+        "Source Dataset": src_dataset,
+        "Source Column": src_col,
+        "Target Dataset": tgt_dataset,
+        "Target Column": tgt_col,
+        "Transform": transform,
+        "Created At": created,
+    }
+    st.session_state.field_lineage_table = pd.concat([
+        st.session_state.field_lineage_table, pd.DataFrame([row])
+    ], ignore_index=True)
+    return edge_id
+
+
+# ------------------------------
+# DATA QUALITY (Great Expectations-style mock)
+# ------------------------------
+def make_open_dq_link(dq_run_id: str):
+    user = st.session_state.user or ""
+    role = st.session_state.role or ""
+    team = st.session_state.team or ""
+    return f"?page=Data%20Quality&dq_run_id={urllib.parse.quote_plus(dq_run_id)}&user={urllib.parse.quote_plus(user)}&role={urllib.parse.quote_plus(role)}&team={urllib.parse.quote_plus(team)}"
+
+
+
+def make_open_health_focus_link(focus: str):
+    """Deep-link back into the Health page with a focused diagnostics view."""
+    user = st.session_state.user or ""
+    role = st.session_state.role or ""
+    team = st.session_state.team or ""
+    return (
+        f"?page=Health&focus={urllib.parse.quote_plus(focus)}"
+        f"&user={urllib.parse.quote_plus(user)}"
+        f"&role={urllib.parse.quote_plus(role)}"
+        f"&team={urllib.parse.quote_plus(team)}"
+    )
+
+
+def add_dq_run(related_type: str, related_id: str, suite: str, status: str, failed_checks: str):
+    dq_id = f"DQ-{str(uuid.uuid4())[:8]}"
+    created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    link = make_open_dq_link(dq_id)
+    row = {
+        "DQ Run Id": dq_id,
+        "Related Type": related_type,
+        "Related Id": related_id,
+        "Expectation Suite": suite,
+        "Status": status,
+        "Failed Checks": failed_checks,
+        "Created At": created,
+        "Open DQ Link": link,
+    }
+    st.session_state.dq_runs_table = pd.concat([st.session_state.dq_runs_table, pd.DataFrame([row])], ignore_index=True)
+    # operational lineage edge
+    add_lineage_edge("DQ Run", dq_id, related_type, related_id, "validates")
+    return dq_id
+
+
+def ensure_dummy_dq():
+    if not st.session_state.dq_runs_table.empty:
+        return
+    add_dq_run("Dataset", "gold.sales.customer_agg", "basic_suite", "PASSED", "")
+    add_dq_run("Dataset", "bronze.sales.orders", "null_checks", "FAILED", "amount_null_rate>0.01")
+
+
+def lineage_for_node(node_id: str) -> pd.DataFrame:
+    df = st.session_state.lineage_table
+    if df.empty:
+        return df
+    mask = (df["From Id"] == node_id) | (df["To Id"] == node_id)
+    return df[mask].copy()
+
+
+def init_state():
+    defaults = {
+        "logged_in": False,
+        "role": None,
+        "user": None,
+        "team": None,
+        "page": "Home",
+        "request_rerun": False,
+
+        "chat_history": [],
+        "chat_draft_by_context": {},
+
+        "org_hierarchy": {
+            "Bronze": {"sales": ["orders", "customers", "events"], "finance": ["payments", "invoices"],
+                       "crm": ["contacts", "accounts"]},
+            "Silver": {"sales": ["orders_clean", "customers_clean"], "finance": ["payments_clean"],
+                       "crm": ["contacts_clean"]},
+            "Gold": {"sales": ["customer_agg", "revenue_mart", "features"], "finance": ["finance_mart"],
+                     "crm": ["crm_mart"]},
+        },
+
+        "openmetadata": {
+            "dataset": "sales.orders",
+            "columns": pd.DataFrame([
+                {"Column": "order_id", "Type": "INT", "Explicit meaning": "Primary key",
+                 "Inferred meaning": "Unique order identifier"},
+                {"Column": "customer_id", "Type": "STRING", "Explicit meaning": "FK to customers",
+                 "Inferred meaning": "Join key to customers.id"},
+                {"Column": "order_ts", "Type": "TIMESTAMP", "Explicit meaning": "Order time",
+                 "Inferred meaning": "Event timestamp for ordering"},
+                {"Column": "amount", "Type": "DOUBLE", "Explicit meaning": "Order amount",
+                 "Inferred meaning": "Revenue metric"},
+            ]),
+            "explicit": {
+                "Display Name": "Customer Orders",
+                "Description": "Confirmed business description (editable).",
+                "Primary Key": "order_id",
+                "Owner": "Sales Team",
+            },
+            "inferred": {
+                "Display Name": "Orders (inferred)",
+                "Primary Key": "order_id",
+                "Description": "Orders table with transactional data",
+                "Join Hint": "orders.customer_id → customers.id",
+                "Confidence": "0.72",
+            }
+        },
+
+        "features_table": pd.DataFrame(
+            columns=["Feature Name", "Entity", "Source Table", "Definition SQL", "Description", "Window",
+                     "Refresh Cadence", "Owner", "Version", "Stage", "Created At"]),
+        "feature_sources_table": pd.DataFrame(
+            columns=["Feature Name", "Dataset", "Confirmed", "Source", "Last Updated"]),
+        "feature_values_registry": pd.DataFrame(
+            columns=["Feature Name", "Entity", "Store", "Materialization Job Id", "Offline Location", "Online Location",
+                     "Status", "Valid From", "Valid To", "Last Updated"]),
+        "models_table": pd.DataFrame(columns=[
+            "Model Name", "Algorithm", "Training Dataset", "Feature Set", "Label Column", "Stage", "Run Id",
+            "Metric (AUC)", "Created At"
+        ]),
+
+        "jobs_table": pd.DataFrame(columns=[
+            "Job Id", "Submitted By", "Role", "Team", "Visibility", "Job Type", "Orchestrator", "Status", "Created At",
+            "Source", "Destination", "Result Location", "Open Job Link"
+        ]),
+        "published_assets": pd.DataFrame(columns=[
+            "Asset Id", "Type", "Name", "Visibility", "Owner", "Team", "Published At", "Source Job Id",
+            "Result Location", "Open Asset Link"
+        ]),
+
+        "lineage_table": pd.DataFrame(columns=[
+            "Edge Id", "From Type", "From Id", "To Type", "To Id", "Relation", "Created At"
+        ]),
+
+        "field_lineage_table": pd.DataFrame(columns=[
+            "Edge Id", "Source Dataset", "Source Column", "Target Dataset", "Target Column", "Transform", "Created At"
+        ]),
+
+        "dq_runs_table": pd.DataFrame(columns=[
+            "DQ Run Id", "Related Type", "Related Id", "Expectation Suite", "Status", "Failed Checks", "Created At",
+            "Open DQ Link"
+        ]),
+
+        "selected_job_id": None,
+        "selected_asset_id": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+init_state()
+
+
+def qp_autologin():
+    qp = st.query_params
+    qp_user = qp.get("user", None)
+    qp_role = qp.get("role", None)
+    qp_team = qp.get("team", None)
+
+    # decode URL-encoded values
+    if qp_user:
+        qp_user = unquote_plus(qp_user)
+    if qp_role:
+        qp_role = unquote_plus(qp_role)
+    if qp_team:
+        qp_team = unquote_plus(qp_team)
+
+    if not st.session_state.logged_in and qp_user and qp_role:
+        st.session_state.logged_in = True
+        st.session_state.user = urllib.parse.unquote_plus(qp_user)
+        st.session_state.role = urllib.parse.unquote_plus(qp_role)
+        st.session_state.team = urllib.parse.unquote_plus(qp_team) if qp_team else ROLE_TEAMS.get(st.session_state.role,
+                                                                                                  "Unknown")
+
+    qp_page = qp.get("page", None)
+    if qp_page:
+        st.session_state.page = qp_page
+
+    qp_job = qp.get("job_id", None)
+    if qp_job:
+        st.session_state.selected_job_id = qp_job
+
+    qp_asset = qp.get("asset_id", None)
+    if qp_asset:
+        st.session_state.selected_asset_id = qp_asset
+
+
+qp_autologin()
+
+
+def rerun():
+    if hasattr(st, "rerun"):
+        st.rerun()
+    elif hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
+
+
+def request_rerun():
+    st.session_state.request_rerun = True
+
+
+def handle_deferred_rerun():
+    if st.session_state.get("request_rerun", False):
+        st.session_state.request_rerun = False
+        rerun()
+
+
+def do_logout_callback():
+    # Important: clear query params; otherwise deep-linked URLs (user/role) will auto-login again.
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+    init_state()
+    request_rerun()
+
+
+def show_table(df: pd.DataFrame, title: str | None = None, height: int | str | None = None):
+    if title:
+        st.markdown(f"### {title}")
+    if df is None or df.empty:
+        st.info("No rows yet.")
+        return
+    kwargs = dict(use_container_width=True, hide_index=True)
+    if height is not None:
+        kwargs["height"] = height
+    st.dataframe(df, **kwargs)
+
+
+def html_table(df: pd.DataFrame, title: str | None = None):
+    """Render a small HTML table with clickable links without requiring pandas.tabulate."""
+    if title:
+        st.markdown(f"### {title}")
+    if df is None or df.empty:
+        st.info("No rows yet.")
+        return
+
+    def esc(s: str) -> str:
+        return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace('"', "&quot;").replace("'", "&#39;"))
+
+    def linkify(v):
+        if v is None:
+            return ""
+        s = str(v)
+        # allow raw badge HTML
+        if s.strip().startswith("<span"):
+            return s
+        # markdown-style [text](url)
+        m = re.match(r"^\[(.*?)\]\((.*?)\)$", s.strip())
+        if m:
+            txt, url = m.group(1), m.group(2)
+            return f"<a href=\"{esc(url)}\">{esc(txt)}</a>"
+        # raw URLs / paths
+        if s.startswith("http://") or s.startswith("https://") or s.startswith("s3://") or s.startswith("?page="):
+            return f"<a href=\"{esc(s)}\">{esc(s)}</a>"
+        return esc(s)
+
+    # build table
+    cols = list(df.columns)
+    thead = "".join(
+        [f"<th style='text-align:left;padding:6px;border-bottom:1px solid #555;'>{esc(c)}</th>" for c in cols])
+    rows_html = ""
+    for _, r in df.iterrows():
+        tds = "".join([f"<td style='padding:6px;border-bottom:1px solid #333;'>{linkify(r[c])}</td>" for c in cols])
+        rows_html += f"<tr>{tds}</tr>"
+    html = f"<table style='width:100%;border-collapse:collapse;'><thead><tr>{thead}</tr></thead><tbody>{rows_html}</tbody></table>"
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def list_editor_table(title: str, items: list[str], key: str):
+    st.markdown(f"### {title}")
+    df = pd.DataFrame({"Value": list(items)})
+    edited = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=key)
+    values = []
+    for v in edited["Value"].tolist():
+        s = str(v).strip()
+        if s:
+            values.append(s)
+    out = []
+    for v in values:
+        if v not in out:
+            out.append(v)
+    return out
+
+
+def kv_editor_table(title: str, data: dict, key: str):
+    st.markdown(f"### {title}")
+    df = pd.DataFrame([{"Key": k, "Value": v} for k, v in data.items()])
+    edited = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=key)
+    out = {}
+    for _, row in edited.iterrows():
+        k = str(row.get("Key", "")).strip()
+        if k:
+            out[k] = row.get("Value", "")
+    return out
+
+
+def search_box(label: str, key: str) -> str:
+    return st.text_input(label, value="", key=key, placeholder="Type to filter...").strip().lower()
+
+
+def md_link(val) -> str:
+    s = "" if val is None else str(val)
+    if s.startswith("s3://") or s.startswith("http://") or s.startswith("https://"):
+        return f"[{s}]({s})"
+    return s
+
+
+def run_ts():
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def with_run_ts(base_path: str):
+    base = base_path.rstrip("/") + "/"
+    return f"{base}run_ts={run_ts()}/"
+
+
+def detect_sql_sources(sql: str):
+    """Best-effort SQL table reference extraction for FROM/JOIN clauses.
+    Returns a list of dataset strings (e.g., gold.sales.customer_agg).
+    """
+    if not sql:
+        return []
+    # remove quoted strings to avoid false positives
+    s = re.sub(r"'[^']*'", "'',", sql)
+    s = re.sub(r'"[^"]*"', '""', s)
+    # capture tokens after FROM / JOIN
+    pats = re.findall(r"\b(from|join)\s+([a-zA-Z0-9_\.]+)", s, flags=re.IGNORECASE)
+    out = []
+    for _, tbl in pats:
+        # strip trailing punctuation
+        tbl = tbl.strip().strip(',').strip(';')
+        if tbl and tbl.lower() not in ["select"]:
+            out.append(tbl)
+    # de-dup preserve order
+    seen = set()
+    dedup = []
+    for t in out:
+        if t.lower() not in seen:
+            seen.add(t.lower())
+            dedup.append(t)
+    return dedup
+
+
+def get_feature_sources(feature_name: str) -> pd.DataFrame:
+    df = st.session_state.get("feature_sources_table", pd.DataFrame())
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Dataset", "Confirmed", "Source", "Last Updated"])
+    sub = df[df["Feature Name"] == feature_name].copy()
+    if sub.empty:
+        return pd.DataFrame(columns=["Dataset", "Confirmed", "Source", "Last Updated"])
+    return sub[["Dataset", "Confirmed", "Source", "Last Updated"]].reset_index(drop=True)
+
+
+def upsert_feature_sources(feature_name: str, rows_df: pd.DataFrame):
+    """Replace all source rows for a feature definition."""
+    base = st.session_state.get("feature_sources_table", pd.DataFrame(
+        columns=["Feature Name", "Dataset", "Confirmed", "Source", "Last Updated"]))
+    base = base[base["Feature Name"] != feature_name].copy()
+    if rows_df is None:
+        st.session_state.feature_sources_table = base
+        return
+    d = rows_df.copy()
+    if d.empty:
+        st.session_state.feature_sources_table = base
+        return
+    d["Feature Name"] = feature_name
+    if "Last Updated" not in d.columns:
+        d["Last Updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        d["Last Updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # fill missing columns
+    if "Confirmed" not in d.columns:
+        d["Confirmed"] = False
+    if "Source" not in d.columns:
+        d["Source"] = "Manual"
+    st.session_state.feature_sources_table = pd.concat(
+        [base, d[["Feature Name", "Dataset", "Confirmed", "Source", "Last Updated"]]], ignore_index=True)
+
+
+def dataset_id_from_s3_path(s3_path: str) -> str:
+    """Best-effort: s3://minio/<zone>/<domain>/<sub>/<dataset>/... -> <zone>.<domain>.<dataset>"""
+    try:
+        p = str(s3_path).replace("s3://minio/", "")
+        parts = [x for x in p.split("/") if x]
+        if len(parts) >= 3:
+            zone = parts[0]
+            domain = parts[1]
+            dataset = parts[2]
+            return f"{zone}.{domain}.{dataset}"
+    except Exception:
+        pass
+    return ""
+
+
+# ------------------------------
+# NAVIGATION (button-based; compatible with Streamlit 1.52.2)
+# ------------------------------
+def go_to_link(link: str):
+    """Navigate using internal query-param links like '?page=Job%20Details&job_id=...'"""
+    if not link:
+        return
+    try:
+        qs = link[1:] if link.startswith("?") else link
+        parsed = parse_qs(qs, keep_blank_values=True)
+
+        # clear and set query params
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+        for k, v in parsed.items():
+            if v:
+                st.query_params[k] = v[0]
+
+        # also update session_state for immediate render
+        if "page" in parsed and parsed["page"]:
+            st.session_state.page = unquote_plus(parsed["page"][0])
+        if "job_id" in parsed and parsed["job_id"]:
+            st.session_state.selected_job_id = parsed["job_id"][0]
+        if "asset_id" in parsed and parsed["asset_id"]:
+            st.session_state.selected_asset_id = parsed["asset_id"][0]
+
+        # autologin params
+        if "user" in parsed and "role" in parsed and parsed["user"] and parsed["role"]:
+            st.session_state.logged_in = True
+            st.session_state.user = unquote_plus(parsed["user"][0])
+            st.session_state.role = unquote_plus(parsed["role"][0])
+        if "team" in parsed and parsed["team"]:
+            st.session_state.team = unquote_plus(parsed["team"][0])
+
+        request_rerun()
+    except Exception:
+        return
+
+
+def make_open_job_link(job_id: str):
+    user = st.session_state.user or ""
+    role = st.session_state.role or ""
+    team = st.session_state.get("team", "") or ""
+    u = urllib.parse.quote_plus(user)
+    r = urllib.parse.quote_plus(role)
+    t = urllib.parse.quote_plus(team)
+    return f"?page=Job%20Details&job_id={job_id}&user={u}&role={r}&team={t}"
+
+
+def make_open_asset_link(asset_id: str):
+    user = st.session_state.user or ""
+    role = st.session_state.role or ""
+    team = st.session_state.get("team", "") or ""
+    u = urllib.parse.quote_plus(user)
+    r = urllib.parse.quote_plus(role)
+    t = urllib.parse.quote_plus(team)
+    return f"?page=Asset%20Details&asset_id={asset_id}&user={u}&role={r}&team={t}"
+
+
+def add_job(job_type: str, orchestrator: str, result_location_base: str, submitted_by: str | None = None,
+            role: str | None = None, status: str = "QUEUED", visibility: str = "Private", team: str | None = None,
+            source: str | None = None, destination: str | None = None):
+    job_id = f"JOB-{str(uuid.uuid4())[:8]}"
+    created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    result_location = with_run_ts(result_location_base)
+    open_link = make_open_job_link(job_id)
+    row = {
+        "Job Id": job_id,
+        "Submitted By": submitted_by if submitted_by else st.session_state.user,
+        "Role": role if role else st.session_state.role,
+        "Team": team if team else st.session_state.team,
+        "Visibility": visibility,
+        "Job Type": job_type,
+        "Orchestrator": orchestrator,
+        "Status": status,
+        "Created At": created,
+        "Source": source if source else "",
+        "Destination": destination if destination else "",
+        "Result Location": result_location,
+        "Open Job Link": open_link,
+    }
+    st.session_state.jobs_table = pd.concat([st.session_state.jobs_table, pd.DataFrame([row])], ignore_index=True)
+    st.session_state.selected_job_id = job_id
+    # Lineage (best-effort mock)
+    if source:
+        add_lineage_edge("Input", source, "Job", job_id, "feeds")
+    if destination:
+        add_lineage_edge("Job", job_id, "Output", destination, "writes")
+    add_lineage_edge("Job", job_id, "Location", result_location, "stores_at")
+    return job_id, open_link, result_location
+
+
+def ensure_dummy_field_lineage():
+    if not st.session_state.field_lineage_table.empty:
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    samples = [
+        ("sales.orders", "order_id", "gold.sales.customer_agg", "order_id", "copy"),
+        ("sales.orders", "customer_id", "gold.sales.customer_agg", "customer_id", "copy"),
+        ("sales.orders", "amount", "gold.sales.customer_agg", "total_revenue", "SUM(amount) GROUP BY customer_id"),
+        ("gold.sales.customer_agg", "total_revenue", "gold.sales.features", "clv", "rename(total_revenue→clv)"),
+        ("silver.crm.customers", "customer_id", "gold.sales.features", "customer_id", "copy"),
+    ]
+    for a, b, c, d, e in samples:
+        add_field_lineage_edge(a, b, c, d, e, created=now)
+
+
+def ensure_dummy_lineage():
+    if not st.session_state.lineage_table.empty:
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    edges = [
+        ("Job", "JOB-DEMO-0001", "Dataset", "bronze.sales.orders", "writes_to"),
+        ("Dataset", "bronze.sales.orders", "Dataset", "silver.sales.orders_clean", "transforms_to"),
+        ("Dataset", "silver.sales.orders_clean", "Dataset", "gold.sales.customer_agg", "aggregates_to"),
+        ("Dataset", "gold.sales.customer_agg", "Feature", "customer_lifetime_value", "feeds_feature"),
+        ("Feature", "customer_lifetime_value", "Model", "churn_model", "feeds_model"),
+        ("Job", "JOB-DEMO-0002", "Asset", "AST-DEMO-0001", "publishes"),
+    ]
+    for ft, fid, tt, tid, rel in edges:
+        edge_id = f"LIN-{str(uuid.uuid4())[:8]}"
+        row = {"Edge Id": edge_id, "From Type": ft, "From Id": fid, "To Type": tt, "To Id": tid, "Relation": rel,
+               "Created At": now}
+        st.session_state.lineage_table = pd.concat([st.session_state.lineage_table, pd.DataFrame([row])],
+                                                   ignore_index=True)
+
+
+def ensure_dummy_assets():
+    if not st.session_state.published_assets.empty:
+        return
+    user = st.session_state.user or "Admin"
+    team = st.session_state.team or "Platform"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    a1 = "AST-" + str(uuid.uuid4())[:8]
+    a2 = "AST-" + str(uuid.uuid4())[:8]
+    st.session_state.published_assets = pd.concat([st.session_state.published_assets, pd.DataFrame([
+        {"Asset Id": a1, "Type": "Dataset", "Name": "gold.sales.customer_agg", "Visibility": "Global", "Owner": user,
+         "Team": team, "Published At": now, "Source Job Id": "JOB-DEMO-0001",
+         "Result Location": "s3://minio/gold/sales/customer_agg/run_ts=20260131_101500/",
+         "Open Asset Link": make_open_asset_link(a1)},
+        {"Asset Id": a2, "Type": "Report", "Name": "Daily Revenue Report", "Visibility": "Team", "Owner": user,
+         "Team": team, "Published At": now, "Source Job Id": "JOB-DEMO-0002",
+         "Result Location": "s3://minio/reports/revenue/run_ts=20260131_090000/",
+         "Open Asset Link": make_open_asset_link(a2)},
+    ])], ignore_index=True)
+
+
+def add_feature_value_record(feature_name: str, entity: str, job_id: str, offline_location: str,
+                             status: str = "MATERIALIZED", valid_from: str | None = None, valid_to: str = "",
+                             store: str = "Feast (Offline)"):
+    """Register a materialized feature-values snapshot (Feast-aligned). Table-only; no JSON."""
+    if valid_from is None:
+        valid_from = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    row = {
+        "Feature Name": feature_name,
+        "Entity": entity,
+        "Store": store,
+        "Materialization Job Id": job_id,
+        "Offline Location": offline_location,
+        "Online Location": "",  # placeholder for future (Redis/Dynamo etc.)
+        "Status": status,
+        "Valid From": valid_from,
+        "Valid To": valid_to,
+        "Last Updated": now,
+    }
+    st.session_state.feature_values_registry = pd.concat(
+        [st.session_state.feature_values_registry, pd.DataFrame([row])],
+        ignore_index=True
+    )
+
+
+def latest_feature_values_rows(feature_name: str | None = None) -> pd.DataFrame:
+    df = st.session_state.feature_values_registry
+    if df is None or df.empty:
+        return df
+    view = df.copy()
+    if feature_name:
+        view = view[view["Feature Name"] == feature_name]
+    # latest per feature by Last Updated
+    view["__ts"] = pd.to_datetime(view["Last Updated"], errors="coerce")
+    view = view.sort_values("__ts", ascending=False).drop(columns=["__ts"])
+    return view
+
+
+def ensure_dummy_feature_values_registry():
+    if not st.session_state.feature_values_registry.empty:
+        return
+    # Illustrative snapshots (Feast offline store) tied to a mock materialization job run
+    add_feature_value_record(
+        feature_name="customer_lifetime_value",
+        entity="customer",
+        job_id="JOB-DEMO-FEAT01",
+        offline_location="s3://minio/feast/offline/customer/customer_lifetime_value/run_ts=20260130_115436/",
+        status="MATERIALIZED",
+        valid_from="2026-01-30 11:54:36"
+    )
+    add_feature_value_record(
+        feature_name="num_orders_30d",
+        entity="customer",
+        job_id="JOB-DEMO-FEAT02",
+        offline_location="s3://minio/feast/offline/customer/num_orders_30d/run_ts=20260130_120015/",
+        status="MATERIALIZED",
+        valid_from="2026-01-30 12:00:15"
+    )
+
+
+def ensure_dummy_jobs():
+    ensure_dummy_field_lineage()
+    ensure_dummy_lineage()
+    ensure_dummy_assets()
+    ensure_dummy_feature_values_registry()
+    if not st.session_state.jobs_table.empty:
+        return
+    add_job("Ingestion", "Airbyte + Airflow", "s3://minio/bronze/sales/orders/", submitted_by="Data Engineer",
+            role="Data Engineer", status="SUCCEEDED")
+    add_job("SQL query", "Airflow + Trino", "s3://minio/gold/sales/mart/query_orders/", submitted_by="Data Analyst",
+            role="Data Analyst", status="RUNNING")
+    add_job("Feature materialization", "Airflow + Spark", "s3://minio/gold/sales/features/customer_lifetime_value/",
+            submitted_by="ML Engineer", role="ML Engineer", status="SUCCEEDED")
+    add_job("Model training", "Airflow + Python", "s3://minio/models/churn_model/", submitted_by="ML Engineer",
+            role="ML Engineer", status="FAILED")
+
+
+def publish_output_from_job(job_id: str, asset_type: str, name: str, visibility: str):
+    assets = st.session_state.published_assets
+    jobs = visible_jobs_for_user()
+    job = jobs[jobs["Job Id"] == job_id].iloc[0]
+    asset_id = f"AST-{str(uuid.uuid4())[:8]}"
+    published_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    open_link = make_open_asset_link(asset_id)
+    row = {
+        "Asset Id": asset_id,
+        "Type": asset_type,
+        "Name": name,
+        "Visibility": visibility,
+        "Owner": st.session_state.user,
+        "Team": st.session_state.team,
+        "Published At": published_at,
+        "Source Job Id": job_id,
+        "Result Location": str(job.get("Result Location", "")),
+        "Open Asset Link": open_link,
+    }
+    st.session_state.published_assets = pd.concat([assets, pd.DataFrame([row])], ignore_index=True)
+    # Lineage: Job -> Asset
+    add_lineage_edge("Job", job_id, "Asset", asset_id, "publishes")
+    st.session_state.selected_asset_id = asset_id
+    st.session_state.page = "Asset Details"
+    request_rerun()
+
+
+def visible_assets_for_user():
+    assets = st.session_state.published_assets
+    if assets.empty:
+        return assets
+    role = st.session_state.role
+    user = st.session_state.user
+    team = st.session_state.team
+    if role == "Admin":
+        return assets
+    global_assets = assets[assets["Visibility"] == "Global"]
+    team_assets = assets[(assets["Visibility"] == "Team") & (assets["Team"] == team)]
+    private_assets = assets[(assets["Visibility"] == "Private") & (assets["Owner"] == user)]
+    return pd.concat([global_assets, team_assets, private_assets], ignore_index=True)
+
+
+def latest_dq_for_job(job_id: str):
+    """Return (status, failed_checks, suite, created_at) for latest DQ run for a job."""
+    df = st.session_state.get("dq_runs_table")
+    if df is None or df.empty:
+        return (None, None, None, None)
+    d = df[(df["Related Type"] == "Job") & (df["Related Id"] == job_id)]
+    if d.empty:
+        return (None, None, None, None)
+    # Created At is string; lexicographic works for YYYY-MM-DD HH:MM:SS
+    d = d.sort_values("Created At", ascending=False)
+    r = d.iloc[0]
+    return (str(r.get("Status", "")), str(r.get("Failed Checks", "")), str(r.get("Expectation Suite", "")),
+            str(r.get("Created At", "")))
+
+
+def dq_badge_html(status: str | None):
+    """Small colored badge for DQ status."""
+    if not status:
+        return "<span style='padding:2px 8px;border-radius:999px;background:#444;color:#fff;font-size:11px;'>No DQ</span>"
+    s = status.upper()
+    if s in ["PASSED", "SUCCESS", "SUCCEEDED"]:
+        bg = "#1f8b4c"
+        txt = "PASSED"
+    elif s in ["FAILED", "FAIL"]:
+        bg = "#b42318"
+        txt = "FAILED"
+    elif s in ["RUNNING"]:
+        bg = "#b54708"
+        txt = "RUNNING"
+    else:
+        bg = "#444"
+        txt = s
+    return f"<span style='padding:2px 8px;border-radius:999px;background:{bg};color:#fff;font-size:11px;font-weight:600;'>{txt}</span>"
+
+
+def visible_jobs_for_user():
+    jobs = st.session_state.jobs_table
+    if jobs is None or jobs.empty:
+        return jobs
+    role = st.session_state.role
+    user = st.session_state.user
+    team = st.session_state.get("team", None)
+    if role == "Admin":
+        return jobs
+    # Visibility rules:
+    # - Global: everyone
+    # - Team: only same team
+    # - Private: only submitter
+    global_jobs = jobs[jobs["Visibility"] == "Global"]
+    team_jobs = jobs[(jobs["Visibility"] == "Team") & (jobs["Team"] == team)]
+    private_jobs = jobs[(jobs["Visibility"] == "Private") & (jobs["Submitted By"] == user)]
+    return pd.concat([global_jobs, team_jobs, private_jobs], ignore_index=True)
+
+
+def jobs_table_with_open(df: pd.DataFrame, title: str, search_key: str):
+    st.markdown(f"### {title}")
+    q = search_box("Search jobs", key=search_key)
+    view = df.copy()
+    if q:
+        cols = ["Job Id", "Job Type", "Orchestrator", "Status", "Created At", "Submitted By", "Source", "Destination",
+                "Result Location"]
+        mask = False
+        for c in cols:
+            if c in view.columns:
+                mask = mask | view[c].astype(str).str.lower().str.contains(q)
+        view = view[mask]
+    if view.empty:
+        st.info("No matching jobs.")
+        return
+
+    # Add DQ badge column based on latest DQ run for each job
+    dq_badges = []
+    for jid in view["Job Id"].astype(str).tolist():
+        status, _, _, _ = latest_dq_for_job(jid)
+        dq_badges.append(dq_badge_html(status))
+    view = view.copy()
+    view.insert(3, "DQ", dq_badges)
+
+    # keep columns compact and linkify important paths
+    out = pd.DataFrame({
+        "Job Id": view["Job Id"],
+        "Job Type": view.get("Job Type", ""),
+        "Status": view.get("Status", ""),
+        "DQ": view["DQ"],
+        "Visibility": view.get("Visibility", ""),
+        "Source": view.get("Source", "").apply(md_link),
+        "Destination": view.get("Destination", "").apply(md_link),
+        "Result Location": view.get("Result Location", "").apply(md_link),
+        "Created At": view.get("Created At", ""),
+        "Open": view.get("Open Job Link", "").apply(lambda x: f"[Open]({x})" if str(x).strip() else ""),
+    })
+    html_table(out, title=None)
+
+
+def assets_table_with_open(df: pd.DataFrame, title: str, search_key: str):
+    st.markdown(f"### {title}")
+    q = search_box("Search assets", key=search_key)
+
+    view = df.copy() if df is not None else pd.DataFrame()
+    if q and not view.empty:
+        cols = ["Asset Id", "Type", "Name", "Visibility", "Owner", "Published At", "Source Job Id"]
+        mask = False
+        for c in cols:
+            if c in view.columns:
+                mask = mask | view[c].astype(str).str.lower().str.contains(q)
+        view = view[mask]
+
+    if view is None or view.empty:
+        st.info("No matching assets.")
+        return
+
+    h = st.columns([2.0, 2.5, 1.0, 1.4, 2.0, 1.0])
+    h[0].markdown("**Asset Id**")
+    h[1].markdown("**Name**")
+    h[2].markdown("**Visibility**")
+    h[3].markdown("**Published**")
+    h[4].markdown("**Result Location**")
+    h[5].markdown("**Open**")
+
+    for _, r in view.sort_values("Published At", ascending=False).iterrows():
+        link = str(r.get("Open Asset Link", ""))
+        res = str(r.get("Result Location", ""))
+        row = st.columns([2.0, 2.5, 1.0, 1.4, 2.0, 1.0])
+        row[0].write(str(r.get("Asset Id", "")))
+        row[1].write(str(r.get("Name", "")))
+        row[2].write(str(r.get("Visibility", "")))
+        row[3].write(str(r.get("Published At", "")))
+        row[4].markdown(md_link(res), unsafe_allow_html=True)
+        if link:
+            if row[5].button("Open", key=f"open_asset_{r.get('Asset Id', '')}"):
+                go_to_link(link)
+        else:
+            row[5].write("—")
+
+
+def page_login():
+    st.title("Data Platform Console – Login (Mock)")
+    user = st.selectbox("Select User", ["Admin", "Data Engineer", "Data Analyst", "ML Engineer"], key="login_user")
+    if st.button("Login", type="primary", key="login_btn"):
+        st.session_state.logged_in = True
+        st.session_state.user = user
+        st.session_state.role = user
+        st.session_state.team = ROLE_TEAMS.get(user, "Unknown")
+        st.session_state.page = "Home"
+        request_rerun()
+
+
+def sidebar():
+    with st.sidebar:
+        st.write(f"👤 **{st.session_state.user}**")
+        st.write(f"Role: **{st.session_state.role}**")
+        st.write(f"Team: **{st.session_state.team}**")
+        col_a, col_b = st.columns([1, 1])
+        with col_a:
+            st.button("Logout", on_click=do_logout_callback, key="logout_btn")
+        with col_b:
+            st.caption(datetime.now().strftime("%Y-%m-%d %H:%M"))
+        st.divider()
+
+        pages = ["Home", "Health", "Logs", "Data Quality", "Lineage", "Field Lineage", "Job Details", "Asset Details"]
+        if st.session_state.role == "Admin":
+            pages += ["Org Levels", "OpenMetadata", "RBAC Matrix"]
+        if st.session_state.role == "Data Engineer":
+            pages += ["Ingestion", "Kafka Ingestion"]
+        if st.session_state.role == "Data Analyst":
+            pages += ["Query Studio"]
+        if st.session_state.role == "ML Engineer":
+            pages += ["Features & Models"]
+
+        choice = st.radio("Navigate", pages,
+                          index=pages.index(st.session_state.page) if st.session_state.page in pages else 0,
+                          key="nav_radio")
+        st.session_state.page = choice
+
+
+def chat_form_split(title: str, default_prompt: str, form_renderer, context_key: str):
+    st.subheader(title)
+    split_ratio = st.slider("Resize panels", 20, 80, 40, help="Adjust NL panel vs form panel.",
+                            key=f"{context_key}__resize")
+    col_chat, col_form = st.columns([split_ratio, 100 - split_ratio])
+
+    with col_chat:
+        st.markdown("**🧠 Natural Language**")
+        for msg in st.session_state.chat_history[-20:]:
+            st.markdown(f"**{msg['role']}**: {msg['text']}")
+        draft_key = f"{context_key}__draft"
+        current_draft = st.session_state.chat_draft_by_context.get(draft_key, "")
+        chat_input = st.text_area("NL Input", value=current_draft, height=120, key=f"{context_key}__chat_input")
+        if st.button("Send NL", type="primary", key=f"{context_key}__send_nl"):
+            if chat_input.strip():
+                st.session_state.chat_history.append({"role": "User", "text": chat_input})
+                st.session_state.chat_history.append(
+                    {"role": "Assistant", "text": "✅ Parsed intent and suggested values (mock)."})
+                st.session_state.chat_draft_by_context[draft_key] = ""
+                request_rerun()
+            else:
+                st.warning("Type something before sending.")
+        if not st.session_state.chat_history:
+            st.info(default_prompt)
+        st.session_state.chat_draft_by_context[draft_key] = chat_input
+
+    with col_form:
+        st.markdown("**📝 Configuration Form (Final Authority)**")
+        form_renderer()
+
+def page_health(embed: bool = False):
+    if not embed:
+        st.title("Platform Health")
+    HEALTH_API = os.getenv("HEALTH_API_URL", "http://10.155.38.64:8005/api/health")
+    try:
+        resp = requests.get(HEALTH_API, timeout=5)
+        data = resp.json()
+        raw_services = data.get("services", data)
+        services = {}
+        for key, value in raw_services.items():
+            if isinstance(value, dict):
+                services[key] = {"status": str(value.get("status", "unknown")).lower()}
+            else:
+                services[key] = {"status": str(value).lower()}
+    except Exception as e:
+        st.error(f"Health API not reachable: {str(e)}")
+        return
+
+    # --- base URLs (optional env overrides) ---
+    GRAFANA_BASE = os.getenv("GRAFANA_BASE_URL", "http://10.155.38.64:3000")
+    PROMETHEUS_BASE = os.getenv("PROMETHEUS_BASE_URL", "http://10.155.38.64:9090")
+
+
+    LOKI_BASE = os.getenv("LOKI_BASE_URL", "http://10.155.38.64:3100")
+    GRAFANA_GRAFANA_DASH_URL = os.getenv(
+        "GRAFANA_GRAFANA_DASH_URL",
+        f"{GRAFANA_BASE}/d/isFoa0z7k/grafana-metrics?orgId=1"
+    )
+
+    GRAFANA_PROMETHEUS_DASH_URL = os.getenv(
+        "GRAFANA_PROMETHEUS_DASH_URL",
+        f"{GRAFANA_BASE}/d/adlrjzm/prometheus-2-0-overview?orgId=1"
+    )
+
+    # Map tool key -> dashboard URL
+    DASHBOARD_URLS = {
+        "grafana": GRAFANA_GRAFANA_DASH_URL,
+        "prometheus": GRAFANA_PROMETHEUS_DASH_URL,
+    }
+    # ✅ Prometheus live check
+    PROMETHEUS_READY_URL = f"{PROMETHEUS_BASE}/-/ready"
+    try:
+        pr = requests.get(PROMETHEUS_READY_URL, timeout=2)
+        services["prometheus"] = {"status": "healthy" if pr.status_code == 200 else "unhealthy"}
+    except Exception:
+        services["prometheus"] = {"status": "unhealthy"}
+
+    # ✅ Grafana live check
+    GRAFANA_HEALTH_URL = f"{GRAFANA_BASE}/api/health"
+    try:
+        gr = requests.get(GRAFANA_HEALTH_URL, timeout=2)
+        ok = False
+        if gr.status_code == 200:
+            try:
+                j = gr.json()
+                ok = (str(j.get("database", "")).lower() == "ok") or (str(j.get("message", "")).lower() == "ok")
+            except Exception:
+                ok = True
+        services["grafana"] = {"status": "healthy" if ok else "unhealthy"}
+    except Exception:
+        services["grafana"] = {"status": "unhealthy"}
+
+    ALL_TOOLS = {
+        "kafka": "Event streaming backbone",
+        "minio": "Object storage (S3-compatible)",
+        "airflow": "Workflow orchestration",
+        "spark": "Distributed processing engine",
+        "trino": "SQL query engine",
+        "keycloak": "Authentication & SSO",
+        "vault": "Secrets management",
+        "prometheus": "Metrics collection",
+        "grafana": "Monitoring dashboards"
+    }
+
+    GRAFANA_DASHBOARDS = {
+        "kafka": "http://10.155.38.64:3000/d/5nhADrDWk/kafka-monitoring?orgId=1&from=now-5m&to=now&refresh=5s",
+        "minio": "http://10.155.38.64:3000/d/TgmJnqnnk/minio-dashboard?orgId=1&from=now-5m&to=now&refresh=5s",
+        "prometheus": os.getenv(
+            "GRAFANA_PROMETHEUS_DASH_URL",
+            "http://10.155.38.64:3000/d/adlrjzm/prometheus-2-0-overview?orgId=1&from=now-30m&to=now&timezone=browser&var-job=$$__all&var-instance=$$__all&var-interval=1h&refresh=30s"
+        ),
+        "grafana": os.getenv(
+            "GRAFANA_GRAFANA_METRICS_DASH_URL",
+            "http://10.155.38.64:3000/d/isFoa0z7k/grafana-metrics?orgId=1&from=now-6h&to=now&timezone=browser"
+        ),
+    }
+
+    rows = []
+
+    for tool_key, purpose in ALL_TOOLS.items():
+        svc = services.get(tool_key, {})
+        status = str(svc.get("status", "unknown")).lower()
+
+        if status == "healthy":
+            color = "limegreen"
+            label = "Healthy"
+        elif status == "unhealthy":
+            color = "crimson"
+            label = "Unhealthy"
+        else:
+            color = "gray"
+            label = "Unknown"
+
+        grafana_url = GRAFANA_DASHBOARDS.get(tool_key, "")
+        grafana_url = str(grafana_url).strip().strip('"').strip("'")  # sanitize quotes
+
+        if grafana_url:
+            if tool_key == "grafana" and status != "healthy":
+                grafana_url = make_open_health_focus_link("grafana")
+            status_html = (
+                f'<a href="{grafana_url}" target="_blank">'
+                f'<span style="color:{color}; font-weight:700;">● {label}</span>'
+                f'</a>'
+            )
+        else:
+            status_html = f'<span style="color:{color}; font-weight:700;">● {label}</span>'
+
+        rows.append({
+            "Tool": tool_key.capitalize(),
+            "Purpose": purpose,
+            "Status": status_html
+        })
+
+    df = pd.DataFrame(rows)
+
+    table_html = df.to_html(
+        classes="health-table",
+        escape=False,
+        index=False
+    )
+
+    st.markdown("""
+    <style>
+    .health-table { width: 100%; border-collapse: collapse; }
+    .health-table th, .health-table td {
+        padding: 12px; text-align: left; border-bottom: 1px solid #ddd; font-size: 14px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown(table_html, unsafe_allow_html=True)
+
+
+
+    # ------------------------------
+    # Grafana DOWN fallback (client-friendly validation)
+    # If Grafana is down, Grafana dashboards cannot render. This section shows evidence
+    # from Prometheus + Loki instead.
+    # ------------------------------
+    focus = st.query_params.get("focus", None)
+    if focus:
+        try:
+            focus = urllib.parse.unquote_plus(str(focus))
+        except Exception:
+            focus = str(focus)
+
+    if focus == "grafana":
+        st.subheader("Grafana metrics – fallback view")
+
+        grafana_status = str(services.get("grafana", {}).get("status", "unknown")).lower()
+        if grafana_status == "healthy":
+            st.success("Grafana is UP ✅")
+            dash_url = GRAFANA_DASHBOARDS.get("grafana", GRAFANA_BASE)
+            st.markdown(f"[Open Grafana metrics dashboard]({dash_url})")
+        else:
+            st.error("Grafana is DOWN ❌ (dashboard UI cannot be rendered)")
+            st.info(
+                "This is expected: when Grafana is stopped, the browser cannot load Grafana dashboards. "
+                "Below is validation evidence from Prometheus + Loki."
+            )
+
+        # --- Prometheus evidence ---
+        st.markdown("### Prometheus validation (Grafana scrape)")
+        up_val = "N/A"
+        try:
+            q = requests.get(
+                f"{PROMETHEUS_BASE}/api/v1/query",
+                params={"query": 'up{job="grafana"}'},
+                timeout=3,
+            ).json()
+            res = q.get("data", {}).get("result", [])
+            if res:
+                up_val = res[0].get("value", [None, "N/A"])[1]
+        except Exception:
+            pass
+
+        last_error, last_scrape, last_health = "", "", ""
+        try:
+            t = requests.get(f"{PROMETHEUS_BASE}/api/v1/targets", timeout=3).json()
+            for tg in t.get("data", {}).get("activeTargets", []):
+                if tg.get("labels", {}).get("job") == "grafana":
+                    last_error = tg.get("lastError", "")
+                    last_scrape = tg.get("lastScrape", "")
+                    last_health = tg.get("health", "")
+                    break
+        except Exception:
+            pass
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric('up{job="grafana"}', up_val)
+        c2.metric("Target health", last_health or "N/A")
+        c3.metric("Last scrape", last_scrape or "N/A")
+        if last_error:
+            st.caption("Last scrape error:")
+            st.code(last_error, language="text")
+
+        # --- Loki evidence ---
+        st.markdown("### Loki evidence (recent scrape failures)")
+        try:
+            rdy = requests.get(f"{LOKI_BASE}/ready", timeout=2)
+            if rdy.status_code != 200:
+                st.warning(f"Loki not ready (HTTP {rdy.status_code}).")
+            else:
+                import time as _time
+                end_ns = int(_time.time() * 1e9)
+                start_ns = int((_time.time() - 60 * 20) * 1e9)  # last 20 minutes
+
+                # Prometheus logs contain scrape errors when Grafana is down.
+                # Alloy ships docker logs to Loki with label service_name=<container_name>
+                query = '{service_name="obs-prometheus"} |~ "scrape|error|failed|refused|timeout|connect|10.155.38.64:3000"'
+                lr = requests.get(
+                    f"{LOKI_BASE}/loki/api/v1/query_range",
+                    params={
+                        "query": query,
+                        "limit": 50,
+                        "start": start_ns,
+                        "end": end_ns,
+                        "direction": "BACKWARD",
+                    },
+                    timeout=6,
+                ).json()
+
+                lines = []
+                for s in lr.get("data", {}).get("result", []):
+                    for ts, line in s.get("values", []):
+                        lines.append(line)
+
+                if not lines:
+                    st.info("No recent scrape error lines found yet. After stopping Grafana, wait ~15–30s and refresh.")
+                else:
+                    st.code("\n".join(lines[-50:]), language="text")
+        except Exception as e:
+            st.warning(f"Loki not reachable: {e}")
+def page_home():
+    st.title("Home")
+    ensure_dummy_jobs()
+
+    jobs = visible_jobs_for_user()
+    assets = visible_assets_for_user()
+
+    st.subheader("Jobs (searchable)")
+    jobs_table_with_open(jobs, "Jobs", "home_jobs_search")
+
+    st.divider()
+    st.subheader("Published assets (searchable)")
+    assets_table_with_open(assets, "Assets", "home_assets_search")
+
+
+def page_lineage():
+    st.title("Lineage")
+    df = st.session_state.lineage_table
+    q = search_box("Search lineage (job id, asset id, table, feature, model...)", key="lineage_search")
+    view = df.copy()
+    if q and not view.empty:
+        mask = False
+        for c in ["From Type", "From Id", "To Type", "To Id", "Relation", "Created At"]:
+            mask = mask | view[c].astype(str).str.lower().str.contains(q)
+        view = view[mask]
+    show_table(view, "Lineage edges")
+
+
+def page_field_lineage():
+    st.title("Field Lineage")
+    df = st.session_state.field_lineage_table
+    q = search_box("Search field lineage (dataset, column...)", key="field_lineage_search")
+    view = df.copy()
+    if q and not view.empty:
+        mask = False
+        for c in ["Source Dataset", "Source Column", "Target Dataset", "Target Column", "Transform", "Created At"]:
+            mask = mask | view[c].astype(str).str.lower().str.contains(q)
+        view = view[mask]
+    show_table(view, "Column-level lineage (mock)")
+
+
+def page_rbac_matrix():
+    st.title("RBAC Matrix")
+    actions = [
+        (A_VIEW_HEALTH, "View platform health"),
+        (A_MANAGE_ORG, "Manage org hierarchy"),
+        (A_EDIT_METADATA, "Edit metadata (OpenMetadata mock)"),
+        (A_SUBMIT_INGESTION, "Submit ingestion jobs"),
+        (A_SUBMIT_QUERY, "Submit query jobs"),
+        (A_MANAGE_FEATURES, "Create/edit features + materialize"),
+        (A_TRAIN_MODELS, "Train models"),
+        (A_PUBLISH_ASSET, "Publish outputs as assets"),
+        (A_SET_VISIBILITY, "Set Team/Global visibility"),
+    ]
+    rows = []
+    for role in ROLE_PERMS.keys():
+        for a, desc in actions:
+            rows.append({
+                "Role": role,
+                "Action": a,
+                "Description": desc,
+                "Allowed": "Yes" if a in ROLE_PERMS.get(role, set()) else "No"
+            })
+    show_table(pd.DataFrame(rows), "Role permissions")
+
+    st.divider()
+    st.markdown("### Current user permissions")
+    my_rows = []
+    for a, desc in actions:
+        my_rows.append({"Action": a, "Description": desc, "Allowed": "Yes" if can(a) else "No"})
+    show_table(pd.DataFrame(my_rows), "You")
+
+
+def page_org_levels():
+    st.title("Admin – Org Levels (Hierarchical)")
+    hierarchy = st.session_state.org_hierarchy
+    l1 = st.selectbox("Level 1", list(hierarchy.keys()), key="org_l1_pick")
+    l2s = list(hierarchy.get(l1, {}).keys())
+    l2s = list_editor_table(f"Level 2 under {l1}", l2s, key=f"org_{l1}_l2_editor")
+
+    new_map = {}
+    for l2 in l2s:
+        new_map[l2] = hierarchy.get(l1, {}).get(l2, [])
+    hierarchy[l1] = new_map
+
+    if l2s:
+        l2_pick = st.selectbox("Choose Level 2 to edit Level 3", l2s, key=f"org_{l1}_l2_pick")
+        l3s = hierarchy[l1].get(l2_pick, [])
+        l3s = list_editor_table(f"Level 3 under {l1} → {l2_pick}", l3s, key=f"org_{l1}_{l2_pick}_l3_editor")
+        hierarchy[l1][l2_pick] = l3s
+
+    st.session_state.org_hierarchy = hierarchy
+
+    rows = []
+    for a, l2map in hierarchy.items():
+        for b, l3list in l2map.items():
+            if l3list:
+                for c in l3list:
+                    rows.append({"Level 1": a, "Level 2": b, "Level 3": c})
+            else:
+                rows.append({"Level 1": a, "Level 2": b, "Level 3": ""})
+    show_table(pd.DataFrame(rows), "Current hierarchy")
+
+
+def page_openmetadata():
+    st.title("OpenMetadata – Dataset View (Mock)")
+    meta = st.session_state.openmetadata
+    dataset = st.text_input("Dataset", value=meta.get("dataset", "sales.orders"), key="om_dataset")
+
+    st.subheader("Columns (explicit meaning is editable)")
+    cols_df = meta.get("columns").copy()
+    meta["columns"] = st.data_editor(cols_df, use_container_width=True, hide_index=True, key="om_cols_editor")
+
+    st.subheader("Dataset metadata")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("#### Explicit Metadata (Editable)")
+        meta["explicit"] = kv_editor_table("Explicit metadata", meta.get("explicit", {}), key="explicit_editor")
+    with c2:
+        st.markdown("#### Inferred Metadata (Read-only)")
+        inferred_df = pd.DataFrame([{"Key": k, "Value": v} for k, v in meta.get("inferred", {}).items()])
+        st.dataframe(inferred_df, use_container_width=True, hide_index=True, height=260)
+
+    if st.button("Save Dataset Metadata", type="primary", key="om_save"):
+        meta["dataset"] = dataset
+        st.session_state.openmetadata = meta
+        st.success("Saved (mock).")
+        request_rerun()
+
+
+def page_ingestion():
+    hierarchy = st.session_state.org_hierarchy
+    mock_sources = {"crm-postgres": {"objects": ["public.customers", "public.orders", "public.events"]},
+                    "files-sftp": {"objects": ["customers.csv", "orders.csv", "events.jsonl"]}}
+
+    def form():
+        source = st.selectbox("Source Connector", list(mock_sources.keys()), key="ing_source")
+        source_object = st.selectbox("Source table / file", mock_sources[source]["objects"], key="ing_source_obj")
+
+        l1 = st.selectbox("Level 1", list(hierarchy.keys()), key="ing_l1")
+        l2 = st.selectbox("Level 2", list(hierarchy.get(l1, {}).keys()), key="ing_l2")
+        level3s = hierarchy.get(l1, {}).get(l2, [])
+        l3 = st.selectbox("Level 3", level3s if level3s else [""], key="ing_l3")
+
+        dest_dataset = st.text_input("Destination dataset name",
+                                     value=source_object.split(".")[-1].replace(".csv", "").replace(".jsonl", ""),
+                                     key="ing_dest_dataset")
+
+        base_prefix = f"s3://minio/{l1.lower()}/{l2}"
+        if str(l3).strip():
+            base_prefix += f"/{l3}"
+        dest_base = f"{base_prefix}/{dest_dataset}/"
+
+        st.dataframe(pd.DataFrame([{
+            "Destination Path (base)": dest_base,
+            "Suggested unique path": with_run_ts(dest_base)
+        }]), use_container_width=True, hide_index=True)
+
+        job_vis = st.selectbox("Job visibility", ["Private", "Team", "Global"], disabled=not can(A_SET_VISIBILITY),
+                               key="ing_job_vis")
+
+        if st.button("Submit ingestion job (mock)", type="primary", key="ing_submit",
+                     disabled=not can(A_SUBMIT_INGESTION)):
+            _, link, _ = add_job("Ingestion", "Airbyte + Airflow", dest_base, status="QUEUED", visibility=job_vis,
+                                 source=source_object, destination=dest_base)
+            success_box(f"✅ Submitted (mock). &nbsp; <a href=\"{link}\">Open Job Details</a>")
+            # Field lineage (mock): map columns 1:1 from source object -> destination dataset id
+            try:
+                dest_ds_id = f"{l1.lower()}.{l2}.{dest_dataset}"
+                cols = st.session_state.openmetadata.get("columns")
+                if isinstance(cols, pd.DataFrame) and not cols.empty and "Column" in cols.columns:
+                    for c in cols["Column"].tolist():
+                        add_field_lineage(str(source_object), str(c), dest_ds_id, str(c), "copy")
+            except Exception:
+                pass
+
+    chat_form_split("Data Ingestion", "Example: Ingest orders into Bronze → sales → orders.", form,
+                    context_key="ingestion")
+
+
+def page_kafka_ingestion():
+    st.title("Kafka Streaming Ingestion")
+    ensure_dummy_jobs()
+    enforce("submit_ingestion")
+
+    hierarchy = st.session_state.org_hierarchy
+
+    topic = st.text_input("Kafka topic", value="crm.contacts", key="kafka_topic")
+    create_topic = st.checkbox("Create topic (mock)", value=True, key="kafka_create_topic")
+    filters = st.text_input("Optional filters", value="event_type = 'UPSERT'", key="kafka_filters")
+
+    l1 = st.selectbox("Level 1", list(hierarchy.keys()), key="kafka_l1")
+    l2 = st.selectbox("Level 2", list(hierarchy.get(l1, {}).keys()), key="kafka_l2")
+    level3s = hierarchy.get(l1, {}).get(l2, [])
+    l3 = st.selectbox("Level 3", level3s if level3s else [""], key="kafka_l3")
+    dest_dataset = st.text_input("Destination dataset name", value="contacts_stream", key="kafka_dest_dataset")
+
+    base_prefix = f"s3://minio/{l1.lower()}/{l2}"
+    if str(l3).strip():
+        base_prefix += f"/{l3}"
+    dest_base = f"{base_prefix}/{dest_dataset}/"
+
+    st.dataframe(pd.DataFrame([{
+        "Topic": topic,
+        "Create topic": "Yes" if create_topic else "No",
+        "Filters": filters,
+        "Output (base)": dest_base,
+        "Suggested unique path": with_run_ts(dest_base)
+    }]), use_container_width=True, hide_index=True)
+
+    if st.button("Start streaming job", type="primary", key="kafka_submit"):
+
+        API_BASE = os.getenv("API_BASE")
+
+        try:
+            topic_resp = requests.post(
+                f"{API_BASE}/api/topics/create-if-not-exists",
+                json={
+                    "topic": topic,
+                    "partitions": 3,
+                    "replicationFactor": 1
+                },
+                timeout=10
+            )
+
+            if topic_resp.status_code != 200:
+                st.error("❌ Topic creation failed")
+                st.stop()
+
+            stream_resp = requests.post(
+                f"{API_BASE}/api/stream/start",
+                json={
+                    "topic": topic,
+                    "partitions": 3,
+                    "replicationFactor": 1
+                },
+                timeout=10
+            )
+
+            if stream_resp.status_code != 200:
+                st.error("❌ Streaming failed")
+                st.stop()
+
+            # 🔥 Trigger Spark Streaming on Spark Laptop
+
+            try:
+                spark_resp = requests.post(
+                    "http://10.80.211.206:9003/start-kafka-stream",
+                    json={"topic": topic},
+                    timeout=60
+                )
+
+                if spark_resp.status_code != 200:
+                    st.error(f"❌ Spark streaming failed: {spark_resp.text}")
+                    st.stop()
+
+            except Exception as e:
+                st.error(f"❌ Spark API connection error: {str(e)}")
+                st.stop()
+
+            topic_result = topic_resp.json()
+            topic_status = topic_result.get("status", "")
+
+            if topic_status == "EXISTS":
+                st.warning("⚠️ Topic already exists")
+
+            elif topic_status == "CREATED":
+                st.success("✅ Topic created successfully")
+
+            result = stream_resp.json()
+
+            job_id, link, result_loc = add_job(
+                "Kafka Stream",
+                "Kafka Connect / Flink",
+                dest_base,
+                status="RUNNING",
+                visibility="Team",
+                source=f"KafkaTopic:{topic}",
+                destination=dest_base
+            )
+
+            add_lineage_edge("Kafka Topic", topic, "Job", job_id, "feeds")
+            add_lineage_edge("Job", job_id, "Dataset", dest_base, "writes_to")
+
+            success_box(
+                f"✅ Streaming started successfully.<br>"
+                f"Status: <b>{result.get('status')}</b><br>"
+                f"<a href='{link}'>Open Job Details</a>"
+            )
+
+        except Exception as e:
+            st.error(f"Connection error: {str(e)}")
+
+            job_id, link, result_loc = add_job(
+                "Kafka Stream",
+                "Kafka Connect / Flink (mock)",
+                dest_base,
+                status="RUNNING",
+                visibility="Team",
+                source=f"KafkaTopic:{topic}",
+                destination=dest_base
+            )
+
+            add_lineage_edge("Kafka Topic", topic, "Job", job_id, "feeds")
+            add_lineage_edge("Job", job_id, "Dataset", dest_base, "writes_to")
+
+            success_box(
+                f"✅ Streaming job started (mock). "
+                f"<a href=\"{link}\">Open Job Details</a>"
+            )
+
+def page_query():
+    def form():
+        st.text_area("SQL", "SELECT * FROM sales.orders LIMIT 10", key="qs_sql")
+        output_name = st.text_input("Result dataset name", "query_result_orders", key="qs_out_name")
+        dest_base = f"s3://minio/gold/sales/mart/{output_name}/"
+
+        st.dataframe(pd.DataFrame([{
+            "Result Location (base)": dest_base,
+            "Suggested unique path": with_run_ts(dest_base),
+            "Execution": "Async job (mock)"
+        }]), use_container_width=True, hide_index=True)
+
+        job_vis = st.selectbox("Job visibility", ["Private", "Team", "Global"], disabled=not can(A_SET_VISIBILITY),
+                               key="qs_job_vis")
+
+        if st.button("Submit query job (mock)", type="primary", key="qs_submit", disabled=not can(A_SUBMIT_QUERY)):
+            _, link, _ = add_job("SQL query", "Airflow + Trino", dest_base, status="QUEUED", visibility=job_vis,
+                                 source="SQL", destination=dest_base)
+            success_box(f"✅ Submitted (mock). &nbsp; <a href=\"{link}\">Open Job Details</a>")
+            # Field lineage (mock): map from current dataset columns -> output dataset columns (1:1)
+            try:
+                src_ds = st.session_state.openmetadata.get("dataset", "sales.orders")
+                dest_ds = f"gold.sales.mart.{output_name}"
+                cols = st.session_state.openmetadata.get("columns")
+                if isinstance(cols, pd.DataFrame) and not cols.empty and "Column" in cols.columns:
+                    for c in cols["Column"].tolist():
+                        add_field_lineage(str(src_ds), str(c), dest_ds, str(c), "sql_select")
+            except Exception:
+                pass
+
+    chat_form_split("Query Studio", "Example: Revenue by country last 30 days", form, context_key="query_studio")
+
+
+def page_ml():
+    st.title("ML – Features & Models")
+    st.caption(
+        "Features are model input variables (X). Define feature logic once, materialize values via jobs, and reuse across models.")
+    ensure_dummy_jobs()
+    tabs = st.tabs(["Feature Definitions", "Models"])
+
+    with tabs[0]:
+        def form_features():
+            feature_name = st.text_input("Feature Definition Name", "customer_lifetime_value", key="f_name")
+            entity = st.selectbox("Entity", ["customer", "account", "device"], key="f_entity")
+            sql = st.text_area("Feature SQL / Logic",
+                               "SELECT customer_id, SUM(revenue) AS clv FROM ... GROUP BY customer_id", key="f_sql")
+
+            st.markdown("**Source datasets (auto-detected from SQL)**")
+            detected = detect_sql_sources(sql)
+            existing = get_feature_sources(feature_name)
+            if existing.empty:
+                src_df = pd.DataFrame(
+                    [{"Dataset": d, "Confirmed": False, "Source": "Detected", "Last Updated": ""} for d in detected])
+                if src_df.empty:
+                    src_df = pd.DataFrame(columns=["Dataset", "Confirmed", "Source", "Last Updated"])
+            else:
+                src_df = existing.copy()
+
+            c_src1, c_src2 = st.columns([1, 1])
+            with c_src1:
+                if st.button("Re-detect from SQL", key="f_redetect"):
+                    src_df = pd.DataFrame(
+                        [{"Dataset": d, "Confirmed": False, "Source": "Detected", "Last Updated": ""} for d in
+                         detect_sql_sources(sql)])
+                    st.session_state["f_sources_editor"] = src_df
+            with c_src2:
+                st.caption("You can edit the detected list. Confirmed = reviewed by owner.")
+
+            editor_df = st.data_editor(
+                st.session_state.get("f_sources_editor", src_df),
+                num_rows="dynamic",
+                use_container_width=True,
+                hide_index=True,
+                key="f_sources_editor",
+            )
+            description = st.text_input("Description", "Total revenue per customer (proxy for CLV).", key="f_desc")
+            window = st.selectbox("Window", ["7d", "30d", "90d", "180d", "All-time"], index=2, key="f_window")
+            cadence = st.selectbox("Refresh Cadence", ["On-demand", "Hourly", "Daily", "Weekly"], index=2,
+                                   key="f_cadence")
+            owner = st.text_input("Owner", st.session_state.get("user", ""), key="f_owner")
+
+            if st.button("Save / Update feature definition", type="primary", key="f_save",
+                         disabled=not can(A_MANAGE_FEATURES)):
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                df = st.session_state.features_table
+                if not df.empty and (df["Feature Name"] == feature_name).any():
+                    idx = df.index[df["Feature Name"] == feature_name][0]
+                    src_list = [str(x) for x in editor_df.get("Dataset", []) if str(x).strip()]
+                    src_display = ", ".join(src_list) if src_list else ""
+                    df.loc[idx, ["Entity", "Source Table", "Definition SQL", "Description", "Window", "Refresh Cadence",
+                                 "Owner", "Created At"]] = [entity, src_display, sql, description, window, cadence,
+                                                            owner, now]
+                    st.session_state.features_table = df
+                else:
+                    src_list = [str(x) for x in editor_df.get("Dataset", []) if str(x).strip()]
+                    src_display = ", ".join(src_list) if src_list else ""
+                    row = {"Feature Name": feature_name, "Entity": entity, "Source Table": src_display,
+                           "Definition SQL": sql, "Description": description, "Window": window,
+                           "Refresh Cadence": cadence, "Owner": owner, "Version": "v1", "Stage": "Draft",
+                           "Created At": now}
+                    st.session_state.features_table = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+                upsert_feature_sources(feature_name, editor_df)
+                # lineage: each source dataset defines this feature
+                for ds in [str(x) for x in editor_df.get("Dataset", []) if str(x).strip()]:
+                    add_lineage_edge("Dataset", ds, "Feature", feature_name, "defines")
+                st.success("Saved (mock).")
+
+            st.markdown("#### Materialize Feature Values (Offline)")
+            st.dataframe(pd.DataFrame([{
+                "What happens": "A job computes feature values per entity and writes to MinIO (offline store).",
+                "Output (base path)": f"s3://minio/gold/features/{entity}/{feature_name}/",
+                "Suggested unique path": with_run_ts(f"s3://minio/gold/features/{entity}/{feature_name}/"),
+            }]), use_container_width=True, hide_index=True)
+
+            if st.button("Submit materialization job (mock)", type="secondary", key="f_submit_job",
+                         disabled=not can(A_MANAGE_FEATURES)):
+                dest_base = f"s3://minio/gold/features/{entity}/{feature_name}/"
+                job_vis = "Team" if can(A_SET_VISIBILITY) else "Private"
+                job_id, link, result_loc = add_job("Feature materialization", "Airflow + Spark", dest_base,
+                                                   status="QUEUED", visibility=job_vis,
+                                                   source=f"Feature:{feature_name}", destination=dest_base)
+                add_feature_value_record(feature_name=feature_name, entity=entity, job_id=job_id,
+                                         offline_location=str(result_loc))
+                success_box(f"✅ Submitted (mock). &nbsp; <a href=\"{link}\">Open Job Details</a>")
+
+            st.divider()
+            show_table(st.session_state.features_table.drop(columns=["Source Table"], errors="ignore"),
+                       "Saved features")
+            st.divider()
+            st.markdown("#### Feature Values Registry (Feast – Offline)")
+            reg = latest_feature_values_rows(feature_name)
+            if reg is None or reg.empty:
+                st.info("No materialized feature values yet. Submit a materialization job to create a registry entry.")
+            else:
+                show_table(reg[["Feature Name", "Entity", "Store", "Materialization Job Id", "Offline Location",
+                                "Status", "Valid From", "Last Updated"]], "Latest materializations for this feature")
+
+            st.markdown("##### All Feature Values (latest first)")
+            show_table(latest_feature_values_rows(), "Feature values registry")
+
+        chat_form_split("Feature Definitions",
+                        "Example: Define feature logic (X variable) and materialize values for reuse.", form_features,
+                        context_key="ml_features")
+
+    with tabs[1]:
+        def form_models():
+            model_name = st.text_input("Model Name", "churn_model", key="m_name")
+            algo = st.selectbox("Algorithm", ["Logistic Regression", "XGBoost", "Random Forest"], key="m_algo")
+
+            assets = visible_assets_for_user()
+            dataset_assets = assets[assets["Type"] == "Dataset"] if not assets.empty else pd.DataFrame()
+            if dataset_assets.empty:
+                training_ds = st.text_input("Training dataset (table/path)", "gold.sales.mart.training_churn",
+                                            key="m_train_ds_manual")
+            else:
+                training_ds = st.selectbox("Training dataset (published)", dataset_assets["Name"].tolist(),
+                                           key="m_train_ds_pick")
+
+            feature_options = st.session_state.features_table[
+                "Feature Name"].tolist() if not st.session_state.features_table.empty else []
+            st.caption(
+                "Select feature definitions (X variables) used by this model. The platform will build training data by joining feature values with labels.")
+            feature_set = st.multiselect("Feature Definitions to use", feature_options,
+                                         default=feature_options[:1] if feature_options else [], key="m_feature_set")
+
+            st.markdown("**Training data source (Feast)**")
+            use_latest = st.checkbox("Use latest materialized Feature Values from Feast (offline)", value=True,
+                                     key="m_use_latest")
+            if use_latest and feature_set:
+                reg = latest_feature_values_rows()
+                resolved = []
+                for f in feature_set:
+                    match = reg[reg["Feature Name"] == f]
+                    if not match.empty:
+                        resolved.append({"Feature Name": f, "Offline Location": match.iloc[0]["Offline Location"],
+                                         "Materialization Job Id": match.iloc[0]["Materialization Job Id"],
+                                         "Status": match.iloc[0]["Status"]})
+                    else:
+                        resolved.append({"Feature Name": f, "Offline Location": "Not materialized yet",
+                                         "Materialization Job Id": "", "Status": "—"})
+                show_table(pd.DataFrame(resolved), "Resolved feature value snapshots (latest)")
+
+            if not feature_set:
+                st.warning("Select at least one Feature Definition to proceed.")
+            label_col = st.text_input("Label column", "churned", key="m_label")
+            stage = st.selectbox("Stage", ["Draft", "Staging", "Production"], key="m_stage")
+
+            if st.button("Submit model training job (mock)", type="primary", key="m_submit",
+                         disabled=(not can(A_TRAIN_MODELS)) or (len(feature_set) == 0)):
+                dest_base = f"s3://minio/models/{model_name}/"
+                job_vis = "Team" if can(A_SET_VISIBILITY) else "Private"
+                _, link, _ = add_job("Model training", "Airflow + Python", dest_base, status="QUEUED",
+                                     visibility=job_vis, source=f"Model:{model_name}", destination=dest_base)
+
+                run_id = str(uuid.uuid4())[:8]
+                auc = 0.84
+                row = {
+                    "Model Name": model_name,
+                    "Algorithm": algo,
+                    "Training Dataset": training_ds,
+                    "Feature Set": ", ".join(feature_set) if feature_set else "",
+                    "Label Column": label_col,
+                    "Stage": stage,
+                    "Run Id": run_id,
+                    "Metric (AUC)": auc,
+                    "Created At": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                st.session_state.models_table = pd.concat([st.session_state.models_table, pd.DataFrame([row])],
+                                                          ignore_index=True)
+                add_lineage_edge("Dataset", training_ds, "Model", model_name, "trains_on")
+                for f in feature_set:
+                    add_lineage_edge("Feature", f, "Model", model_name, "uses_feature")
+
+                success_box(f"✅ Submitted (mock). &nbsp; <a href=\"{link}\">Open Job Details</a>")
+
+            st.divider()
+            show_table(st.session_state.models_table, "Models registry (mock)")
+
+        chat_form_split("Models", "Example: Train model from curated training dataset.", form_models,
+                        context_key="ml_models")
+
+
+def serving_tabs(result_location: str, key_prefix: str):
+    st.markdown("### Consume results (Serving options)")
+    st.markdown(f"**Result location:** {md_link(result_location)}")
+    tabs = st.tabs(["API", "SFTP", "Download", "Sample preview"])
+
+    with tabs[0]:
+        st.markdown("#### API")
+        auth_df = pd.DataFrame([
+            {"Auth option": "Keycloak OAuth2 (recommended)", "When to use": "User-facing APIs"},
+            {"Auth option": "Signed JWT (service-to-service)", "When to use": "Internal services"},
+            {"Auth option": "API Key (least preferred)", "When to use": "Simple integrations; rotate keys"},
+            {"Auth option": "mTLS", "When to use": "High-trust internal networks"},
+        ])
+        st.dataframe(auth_df, use_container_width=True, hide_index=True)
+        endpoint = st.text_input("Endpoint route (mock)", f"/v1/results/{key_prefix}", key=f"api_route_{key_prefix}")
+        auth = st.selectbox("Auth", auth_df["Auth option"].tolist(), key=f"api_auth_{key_prefix}")
+        st.dataframe(pd.DataFrame([{"Endpoint": endpoint, "Auth": auth, "Backed by": result_location}]),
+                     use_container_width=True, hide_index=True)
+
+    with tabs[1]:
+        st.markdown("#### SFTP")
+        st.dataframe(pd.DataFrame([{"SFTP path": f"/exports/{key_prefix}/", "Source": result_location}]),
+                     use_container_width=True, hide_index=True)
+
+    with tabs[2]:
+        st.markdown("#### Download")
+        st.dataframe(pd.DataFrame([{"Location": result_location, "How": "Presigned URL from MinIO (real build)"}]),
+                     use_container_width=True, hide_index=True)
+
+    with tabs[3]:
+        st.markdown("#### Sample preview")
+        st.dataframe(pd.DataFrame(
+            [{"col1": "value1", "col2": 10}, {"col1": "value2", "col2": 20}, {"col1": "value3", "col2": 30}]),
+                     use_container_width=True, hide_index=True)
+
+
+def page_job_details():
+    st.title("Job Details")
+    ensure_dummy_jobs()
+
+    jobs = visible_jobs_for_user()
+    job_id = st.session_state.selected_job_id
+
+    if not job_id or (jobs["Job Id"] == job_id).sum() == 0:
+        jobs_table_with_open(jobs, "Jobs", "jd_jobs_search")
+        st.info("Use the Open link above to open a job.")
+        return
+
+    job = jobs[jobs["Job Id"] == job_id].iloc[0]
+    st.dataframe(pd.DataFrame([job.to_dict()]), use_container_width=True, hide_index=True)
+
+    st.info(
+        "Advanced: In a real deployment, this Job Details would deep-link to the underlying OSS tool UIs (Airflow/Kafka/Trino). Below are mock links.")
+    adv_df = pd.DataFrame([
+        {"Action": "Open in Airflow UI", "Link": "https://airflow.apache.org/docs/"},
+        {"Action": "Open in Kafka UI", "Link": "https://kafka.apache.org/quickstart"},
+        {"Action": "Open in Trino UI", "Link": "https://trino.io/docs/current/"},
+    ])
+    adv_df["Action"] = adv_df.apply(lambda r: f"[{r['Action']}]({r['Link']})", axis=1)
+    html_table(adv_df[["Action"]])
+
+    st.markdown("### Lineage")
+    show_table(lineage_for_node(job_id), "Edges involving this job")
+
+    # Field-level lineage (mock)
+    dest_ds = dataset_id_from_s3_path(str(job.get("Destination", "")))
+    fld = st.session_state.field_lineage_table
+    if dest_ds and not fld.empty:
+        view = fld[fld["Target Dataset"].astype(str) == dest_ds]
+        if view.empty:
+            # fallback: match by dataset folder name if ids differ
+            view = fld[fld["Target Dataset"].astype(str).str.contains(dest_ds.split(".")[-1], case=False, na=False)]
+        if not view.empty:
+            show_table(view, "Field lineage into this destination")
+
+    serving_tabs(str(job.get("Result Location", "")), job_id)
+
+    st.divider()
+    st.markdown("### Data Quality checks (Great Expectations - mock)")
+    suites = ["basic_suite", "null_checks", "pk_uniqueness"]
+    suite = st.selectbox("Expectation Suite", suites, key="dq_suite")
+    if st.button("Run DQ checks (mock)", key="dq_run_btn"):
+        # simple illustration: mark failures when suite is null_checks
+        status = "FAILED" if suite == "null_checks" else "PASSED"
+        failed = "amount_null_rate>0.01" if status == "FAILED" else ""
+        add_dq_run("Job", job_id, suite, status, failed)
+        st.success("DQ run recorded (mock).")
+        request_rerun()
+
+    # show last few dq runs for this job
+    dq = st.session_state.dq_runs_table
+    if not dq.empty:
+        recent = dq[dq["Related Id"] == job_id].sort_values("Created At", ascending=False).head(5)
+        if not recent.empty:
+            rows = []
+            for _, r in recent.iterrows():
+                rows.append({
+                    "DQ Run Id": r["DQ Run Id"],
+                    "Suite": r["Expectation Suite"],
+                    "Status": r["Status"],
+                    "Failed Checks": r["Failed Checks"],
+                    "Open": f"[Open]({r['Open DQ Link']})",
+                })
+            html_table(pd.DataFrame(rows))
+
+    st.divider()
+    st.markdown("### Publish output (creates Published Asset)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        asset_type = st.selectbox("Type", ["Dataset", "Feature output", "Model artifact", "Report"], key="pub_type")
+    with c2:
+        asset_name = st.text_input("Name", f"{job.get('Job Type', 'Output')} - {job_id}", key="pub_name")
+    with c3:
+        visibility = st.selectbox("Visibility", ["Private", "Team", "Global"], key="pub_vis")
+
+    if st.button("Publish", type="primary", key="pub_btn", disabled=not can(A_PUBLISH_ASSET)):
+        publish_output_from_job(job_id, asset_type, asset_name, visibility)
+        st.success("Published (mock).")
+
+
+def page_asset_details():
+    st.title("Asset Details")
+
+    assets_all = st.session_state.published_assets
+    if assets_all.empty:
+        st.info("No published assets yet. Publish from Job Details.")
+        return
+
+    assets_visible = visible_assets_for_user()
+    asset_id = st.session_state.selected_asset_id
+
+    if not asset_id or (assets_visible["Asset Id"] == asset_id).sum() == 0:
+        assets_table_with_open(assets_visible, "Published assets you can access", "ad_assets_search")
+        st.info("Use the Open link above to open an asset.")
+        return
+
+    asset = assets_all[assets_all["Asset Id"] == asset_id].iloc[0]
+    st.dataframe(pd.DataFrame([asset.to_dict()]), use_container_width=True, hide_index=True)
+
+    st.markdown("### Lineage")
+    show_table(lineage_for_node(asset_id), "Edges involving this asset")
+
+    # Field-level lineage (mock)
+    dest_ds = dataset_id_from_s3_path(str(asset.get("Result Location", "")))
+    fld = st.session_state.field_lineage_table
+    if dest_ds and not fld.empty:
+        view = fld[fld["Target Dataset"].astype(str) == dest_ds]
+        if view.empty:
+            view = fld[fld["Target Dataset"].astype(str).str.contains(dest_ds.split(".")[-1], case=False, na=False)]
+        if not view.empty:
+            show_table(view, "Field lineage into this asset")
+
+    serving_tabs(str(asset.get("Result Location", "")), asset_id)
+
+
+def page_data_quality():
+    st.title("Data Quality (Great Expectations - mock)")
+    ensure_dummy_jobs()
+    ensure_dummy_dq()
+
+    # search
+    q = search_box("Search DQ runs", key="dq_search")
+    df = st.session_state.dq_runs_table.copy()
+    if q:
+        mask = False
+        for c in ["DQ Run Id", "Related Type", "Related Id", "Expectation Suite", "Status", "Failed Checks",
+                  "Created At"]:
+            mask = mask | df[c].astype(str).str.lower().str.contains(q)
+        df = df[mask]
+    if df.empty:
+        st.info("No matching DQ runs.")
+        return
+
+    # Render with clickable Open
+    rows = []
+    for _, r in df.sort_values("Created At", ascending=False).iterrows():
+        rows.append({
+            "DQ Run Id": r["DQ Run Id"],
+            "Related": f"{r['Related Type']} / {r['Related Id']}",
+            "Suite": r["Expectation Suite"],
+            "Status": r["Status"],
+            "Failed Checks": r["Failed Checks"],
+            "Created At": r["Created At"],
+            "Open": f"[Open]({r['Open DQ Link']})",
+        })
+    html_table(pd.DataFrame(rows))
+
+
+def router():
+    if not st.session_state.logged_in:
+        page_login()
+        handle_deferred_rerun()
+        return
+
+    sidebar()
+
+    page = st.session_state.page
+    if page == "Home":
+        page_home()
+    elif page == "Health":
+        page_health(embed=False)
+    elif page == "Logs":
+        page_logs()
+    elif page == "Data Quality":
+        page_data_quality()
+
+    elif page == "Lineage":
+        page_lineage()
+    elif page == "Field Lineage":
+        page_field_lineage()
+    elif page == "RBAC Matrix":
+        if can(A_VIEW_RBAC):
+            page_rbac_matrix()
+        else:
+            st.warning("You do not have access to RBAC Matrix.")
+            st.session_state.page = "Home"
+    elif page == "Org Levels":
+        if can(A_MANAGE_ORG):
+            page_org_levels()
+        else:
+            st.warning("You do not have access to Org Levels.")
+            st.session_state.page = "Home"
+    elif page == "OpenMetadata":
+        if can(A_EDIT_METADATA):
+            page_openmetadata()
+        else:
+            st.warning("You do not have access to OpenMetadata.")
+            st.session_state.page = "Home"
+    elif page == "Ingestion":
+        page_ingestion()
+    elif page == "Kafka Ingestion":
+        page_kafka_ingestion()
+    elif page == "Query Studio":
+        page_query()
+    elif page == "Features & Models":
+        page_ml()
+    elif page == "Job Details":
+        page_job_details()
+    elif page == "Asset Details":
+        page_asset_details()
+
+    handle_deferred_rerun()
+
+
+router()
+

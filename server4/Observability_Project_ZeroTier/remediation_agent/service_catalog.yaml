@@ -1,0 +1,99 @@
+services:
+  grafana:
+    service: grafana
+    display_name: Grafana
+    health_name: grafana
+    runtime: systemd
+    node: local
+    systemd_unit: grafana
+    team: platform
+    priority: high
+    log_selector: '{service_name="obs-grafana"}'
+
+  prometheus:
+    service: prometheus
+    display_name: Prometheus
+    health_name: prometheus
+    runtime: docker
+    node: local
+    container_name: obs-prometheus
+    team: platform
+    priority: high
+    log_selector: '{service_name="obs-prometheus"}'
+
+  kafka:
+    service: kafka
+    display_name: Kafka
+    health_name: kafka
+    runtime: docker-compose
+    node: local
+    compose_service: kafka
+    team: dataeng
+    priority: high
+    log_selector: '{service_name="obs-kafka"}'
+
+  minio:
+    service: minio
+    display_name: MinIO
+    health_name: minio
+    runtime: docker-compose
+    node: local
+    compose_service: minio
+    team: dataeng
+    priority: medium
+    log_selector: '{service_name="obs-minio"}'
+
+  spark:
+    service: spark
+    display_name: Spark
+    health_name: spark
+    runtime: docker-compose
+    node: local
+    compose_service: spark
+    team: dataeng
+    priority: high
+    log_selector: '{service_name="obs-spark"}'
+
+  trino:
+    service: trino
+    display_name: Trino
+    health_name: trino
+    runtime: docker-compose
+    node: local
+    compose_service: trino
+    team: platform
+    priority: medium
+    log_selector: '{service_name="obs-trino"}'
+
+  airflow:
+    service: airflow
+    display_name: Airflow
+    health_name: airflow
+    runtime: docker-compose
+    node: local
+    compose_service: airflow-webserver
+    team: dataeng
+    priority: medium
+    log_selector: '{service_name=~"obs-airflow.*"}'
+
+  keycloak:
+    service: keycloak
+    display_name: Keycloak
+    health_name: keycloak
+    runtime: docker-compose
+    node: local
+    compose_service: keycloak
+    team: platform
+    priority: medium
+    log_selector: '{service_name="obs-keycloak"}'
+
+  vault:
+    service: vault
+    display_name: Vault
+    health_name: vault
+    runtime: docker-compose
+    node: local
+    compose_service: vault
+    team: platform
+    priority: high
+    log_selector: '{service_name="obs-vault"}'

@@ -1,0 +1,59 @@
+services:
+
+  kafka-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kafka-api
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "0.0.0.0:8601:8601"        # Kafka Control FastAPI on ZeroTier 10.155.38.64:8601
+    restart: unless-stopped
+    networks:
+      - obsnet
+
+  kafka-streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    container_name: kafka-streamlit
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "0.0.0.0:8501:8501"        # Streamlit UI on ZeroTier 10.155.38.64:8501
+    env_file:
+      - .env.grafana
+    environment:
+      LOKI_PURGING_MECHANISM: "Retention-based deletion"
+      LOKI_ARCHIVAL_MECHANISM: "Not configured"
+      LOKI_RETENTION_PERIOD: "7d"
+
+      PUBLIC_BASE_IP: "10.155.38.64"
+      PUBLIC_BASE_URL: "http://10.155.38.64"
+      STREAMLIT_BASE_URL: "http://10.155.38.64:8501"
+
+      OBS_AI_API_URL: ${OBS_AI_API_URL:-http://10.155.38.64:8088}
+      OBS_AI_BASE_URL: "http://10.155.38.64:8088"
+
+      API_BASE: ${API_BASE:-http://10.155.38.64:8601}
+      KAFKA_API_BASE_URL: "http://10.155.38.64:8601"
+
+      HEALTH_API_URL: ${HEALTH_API_URL:-http://obs-health-api:8000/api/health}
+
+      LOKI_BASE_URL: ${LOKI_BASE_URL:-http://10.155.38.64:3100}
+      GRAFANA_BASE_URL: ${GRAFANA_BASE_URL:-http://10.155.38.64:3000}
+      PROMETHEUS_BASE_URL: ${PROMETHEUS_BASE_URL:-http://10.155.38.64:9090}
+
+      GRAFANA_GRAFANA_DASH_URL: ${GRAFANA_GRAFANA_DASH_URL:-http://10.155.38.64:3000/d/isFoa0z7k/grafana-metrics?orgId=1&from=now-6h&to=now&timezone=browser}
+      GRAFANA_PROMETHEUS_DASH_URL: ${GRAFANA_PROMETHEUS_DASH_URL:-http://10.155.38.64:3000/d/ad4pdfz/prometheus-2-0-overview?orgId=1&from=now-30m&to=now&timezone=browser&var-job=$$__all&var-instance=$$__all&var-interval=1h&refresh=30s}
+    depends_on:
+      - kafka-api
+    restart: unless-stopped
+    networks:
+      - obsnet
+
+networks:
+  obsnet:
+    external: true
+    name: observability-stack_default  # joins the same network as observability-stack
