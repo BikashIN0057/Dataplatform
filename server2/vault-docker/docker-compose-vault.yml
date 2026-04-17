@@ -1,0 +1,16 @@
+services: 
+  vault: 
+    image: hashicorp/vault:1.15 
+    container_name: vault 
+    env_file: 
+      - .env 
+    environment: 
+      - VAULT_DEV_ROOT_TOKEN_ID=${VAULT_DEV_ROOT_TOKEN_ID} 
+      - VAULT_DEV_LISTEN_ADDRESS=${VAULT_DEV_LISTEN_ADDRESS} 
+      - VAULT_API_ADDR=${VAULT_API_ADDR} 
+    ports: 
+      - "${VAULT_HOST}:${VAULT_PORT}:8200" 
+    cap_add: 
+      - IPC_LOCK 
+    command: vault server -dev 
+    restart: unless-stopped

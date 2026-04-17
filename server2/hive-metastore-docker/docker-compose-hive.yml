@@ -1,0 +1,21 @@
+services: 
+  hive-metastore: 
+    image: apache/hive:3.1.3 
+    container_name: hive-metastore 
+    env_file: 
+      - .env 
+    ports: 
+      - "${HIVE_HOST}:${HIVE_METASTORE_PORT}:9083" 
+    environment: 
+      SERVICE_NAME: metastore 
+      DB_DRIVER: postgres 
+      IS_RESUME: "true"
+      SKIP_SCHEMA_INIT: "true"
+      SERVICE_OPTS: -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://${HIVE_DB_HOST}:${HIVE_DB_PORT}/${HIVE_DB_NAME} -Djavax.jdo.option.ConnectionUserName=${HIVE_DB_USER} -Djavax.jdo.option.ConnectionPassword=${HIVE_DB_PASSWORD} 
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -tnlp | grep 9083 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
